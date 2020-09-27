@@ -9,7 +9,7 @@ jobs:
         steps:
             - uses: actions/checkout@master
             - name: compile and release
-              uses: ngs/go-release.action
+              uses: ngs/go-release.action@master
               env:
                   GO111MODULE: on
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
