@@ -1,0 +1,69 @@
+{
+  "tables": [
+    {
+      "name": "member",
+      "columns": [
+        {
+          "name": "email",
+          "transformations": [
+            {
+              "type": "template",
+              "options": {
+                "template": "user-{{ .Row.id }}@opinahjo.fi"
+              }
+            }
+          ]
+        },
+        {
+          "name": "first_name",
+          "transformations": [
+            {
+              "type": "template",
+              "options": {
+                "template": "{{ md5 (substr 0 15 (.FieldValue)) }}_first"
+              }
+            }
+          ]
+        },
+        {
+          "name": "last_name",
+          "transformations": [
+            {
+              "type": "template",
+              "options": {
+                "template": "{{ md5 (substr 0 15 (.FieldValue)) }}_last"
+              }
+            }
+          ]
+        },
+        {
+          "name": "password",
+          "transformations": [
+            {
+              "type": "value",
+              "options": {
+                "value": "$2y$15$vrgRgR4mhjfOWEO/iNkac.y3n8HaAhcb2tY3OgVy0GWBfod8Wk2Pu"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "organization",
+      "columns": [
+        {
+          "name": "company_name",
+          "transformations": [
+            {
+              "type": "template",
+              "options": {
+                "template": "company+{{ .Row.id }}"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
