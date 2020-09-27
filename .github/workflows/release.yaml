@@ -11,6 +11,7 @@ jobs:
             - name: compile and release
               uses: ngs/go-release.action@v1.0.2
               env:
+                  GO111MODULE: on
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
                   GOARCH: amd64
                   GOOS: linux
