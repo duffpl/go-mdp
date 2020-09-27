@@ -16,3 +16,4 @@ jobs:
                   GOARCH: amd64
                   GOOS: linux
                   EXTRA_FILES: "LICENSE"
+                  PROJECT_NAME: go-mdp
