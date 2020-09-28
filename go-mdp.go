@@ -21,8 +21,9 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"time"
 )
+
+var appVersion = "v0.0.9"
 
 type TableConfig struct {
 	Name    string         `json:"name"`
@@ -95,7 +96,6 @@ func init() {
 }
 
 func main() {
-	then := time.Now()
 	config, dumpOptions := parseArgs()
 	var input io.Reader
 	var output io.Writer
@@ -136,7 +136,6 @@ func main() {
 		}
 	}
 	processBuffer()
-	fmt.Println(time.Since(then))
 }
 
 func parseArgs() (Config, DumpOptions) {
@@ -144,6 +143,7 @@ func parseArgs() (Config, DumpOptions) {
 	configFilePath := argParser.String("c", "config", &argparse.Options{Required: false, Help: "Path to config.json", Default: "config.json"})
 	dumpFilePath := argParser.String("i", "input", &argparse.Options{Required: false, Help: "Path to dump file. If not set STDIN is used as input"})
 	outputFilePath := argParser.String("o", "output", &argparse.Options{Required: false, Help: "Path to output file. If not set STDOUT is used"})
+	showVersion := argParser.Flag("v", "version", &argparse.Options{Required: false, Help: "Show version"})
 
 	dumpOptions := DumpOptions{
 		InputFile:  dumpFilePath,
@@ -154,6 +154,10 @@ func parseArgs() (Config, DumpOptions) {
 	if err != nil {
 		fmt.Print(argParser.Usage(err))
 		os.Exit(1)
+	}
+	if *showVersion {
+		println(appVersion)
+		os.Exit(0)
 	}
 	return readConfigFile(*configFilePath), dumpOptions
 }
@@ -301,8 +305,8 @@ func (p preparsedInsertStmt) GetType() string {
 }
 
 var preparseRegexps = map[statementType]*regexp.Regexp{
-	statementTypeInsert:      regexp.MustCompile(`(?m)^(?:/\*!\d+ )?INSERT(?: (?:LOWPRIORITY|DELAYED|HIGH_PRIORITY))?(?: IGNORE)? INTO \x60?(\w+)\x60?`),
-	statementTypeCreateTable: regexp.MustCompile(`(?m)^(?:/\*!\d+ )?CREATE(?: TEMPORARY)? TABLE(?: IF NOT EXISTS)? \x60?(\w+)\x60?`),
+	statementTypeInsert:      regexp.MustCompile(`(?m)^(?:\/\*!\d+ )?INSERT(?: (?:LOWPRIORITY|DELAYED|HIGH_PRIORITY))?(?: IGNORE)? INTO \x60?(\w+)\x60?`),
+	statementTypeCreateTable: regexp.MustCompile(`(?m)^(?:\/\*!\d+ )?CREATE(?: TEMPORARY)? TABLE(?: IF NOT EXISTS)? \x60?(\w+)\x60?`),
 }
 
 func preparse(line string) preparsedStatement {

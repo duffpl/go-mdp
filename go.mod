@@ -19,6 +19,7 @@ require (
 	github.com/pingcap/tipb v0.0.0-20200813070854-57da1e63f73e // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20200410134404-eec4a21b6bb0 // indirect
 	github.com/sirupsen/logrus v1.6.0
+	github.com/spf13/viper v1.7.1 // indirect
 	golang.org/x/crypto v0.0.0-20200820211705-5c72a883971a // indirect
 	golang.org/x/tools v0.0.0-20200923053713-ba800b16d873 // indirect
 	syreclabs.com/go/faker v1.2.2
