@@ -1,14 +1,32 @@
 package transformations
 
-import "bytes"
+import (
+	"bytes"
+	"github.com/pingcap/parser/ast"
+)
 
-func TransformRowTemplate(row MappedRow, options TransformationOptions) interface{} {
-	transformationTemplate := options["template"].(string)
+var templateTransformationType ColumnTransformationType = "template"
+var valueTransformationType ColumnTransformationType = "value"
+
+type TemplateOptions struct {
+	Template string `json:"template"`
+}
+
+type ValueOptions struct {
+	Value interface{} `json:"template"`
+}
+
+type transformData struct {
+	Row        MappedRow
+	FieldValue string
+}
+
+func TransformRowTemplate(row MappedRow, fieldValue ast.ValueExpr, options TemplateOptions) interface{} {
+	transformationTemplate := options.Template
 	output := new(bytes.Buffer)
-	e := getCompiledTemplate(transformationTemplate).Execute(output, struct {
-		Row MappedRow
-	}{
-		row,
+	e := getCompiledTemplate(transformationTemplate).Execute(output, transformData{
+		Row:        row,
+		FieldValue: fieldValue.GetString(),
 	})
 	if e != nil {
 		panic(e)

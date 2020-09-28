@@ -21,53 +21,62 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 )
 
-type TableTransform struct {
-	Type    string                      `json:"type"`
-	Field   string                      `json:"field"`
-	Options transformations.TransformationOptions `json:"options"`
+type TableConfig struct {
+	Name    string         `json:"name"`
+	Columns []ColumnConfig `json:"columns"`
+}
+
+type ColumnConfig struct {
+	Name            string                       `json:"name"`
+	Transformations []ColumnTransformationConfig `json:"transformations"`
+}
+
+func (t TableConfig) GetColumnConfigByName(name string) ColumnConfig {
+	for i := range t.Columns {
+		if t.Columns[i].Name == name {
+			return t.Columns[i]
+		}
+	}
+	return ColumnConfig{}
+}
+
+type ColumnTransformationConfig struct {
+	Function transformations.TranformationFunction
+}
+
+func (c *ColumnTransformationConfig) UnmarshalJSON(i []byte) error {
+	configData := &struct {
+		Type    transformations.ColumnTransformationType `json:"type"`
+		Options json.RawMessage                          `json:"options"`
+	}{}
+	json.Unmarshal(i, configData)
+	c.Function = transformations.GetTransformation(configData.Type, configData.Options)
+	return nil
 }
 
 type Config struct {
-	TableTransforms map[string][]TableTransform
-	Patterns []ConfigPattern `json:"patterns"`
-	PostSQL string `json:"postSql,omitempty"`
+	TableConfigs []TableConfig `json:"tables"`
+	PostSQL      string        `json:"postSql,omitempty"`
+}
+
+func (c Config) GetTableConfig(name string) TableConfig {
+	for i := range c.TableConfigs {
+		currentConfig := c.TableConfigs[i]
+		if currentConfig.Name != name {
+			continue
+		}
+		return currentConfig
+	}
+	return TableConfig{}
 }
 
 type DumpOptions struct {
-	InputFile *string
+	InputFile  *string
 	OutputFile *string
 }
-
-type ConfigPattern struct {
-	TableName string         `json:"tableName"`
-	Fields    []PatternField `json:"fields"`
-	Skip bool `json:"skip,omitempty"`
-}
-
-type PatternField struct {
-	Field       string                      `json:"field"`
-	Position    int                         `json:"position"`
-	Type        string                      `json:"type"`
-	Constraints []PatternFieldConstraint    `json:"constraints"`
-	Options     transformations.TransformationOptions `json:"options,omitempty"`
-}
-
-type PatternFieldConstraint struct {
-	Field    string `json:"field"`
-	Position int    `json:"position"`
-	Value    string `json:"value"`
-}
-
-var (
-	fieldTransformationsMap = map[string]func(expr ast.ValueExpr, options transformations.TransformationOptions) interface{} {
-		"value":    transformations.TransformFieldValue,
-	}
-	rowTransformationsMap = map[string]func(row transformations.MappedRow, options transformations.TransformationOptions) interface{} {
-		"template": transformations.TransformRowTemplate,
-	}
-)
 
 // Many thanks to https://stackoverflow.com/a/47515580/1454045
 func init() {
@@ -86,6 +95,7 @@ func init() {
 }
 
 func main() {
+	then := time.Now()
 	config, dumpOptions := parseArgs()
 	var input io.Reader
 	var output io.Writer
@@ -95,14 +105,14 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		input = bufio.NewReaderSize(f, 4096)
+		input = bufio.NewReaderSize(f, 16*4096)
 	} else {
 		input = os.Stdin
 	}
 
 	if *dumpOptions.OutputFile != "" {
 		f, _ := os.Create(*dumpOptions.OutputFile)
-		output = bufio.NewWriterSize(f, 4096)
+		output = bufio.NewWriterSize(f, 16*4096)
 	} else {
 		output = os.Stdout
 	}
@@ -110,7 +120,7 @@ func main() {
 	lineBuffer := make(map[int]string)
 	currentLineNumber := 0
 	var processBuffer func()
-	processBuffer = func(){
+	processBuffer = func() {
 		if line, found := lineBuffer[currentLineNumber]; found {
 			output.Write([]byte(line))
 			delete(lineBuffer, currentLineNumber)
@@ -126,6 +136,7 @@ func main() {
 		}
 	}
 	processBuffer()
+	fmt.Println(time.Since(then))
 }
 
 func parseArgs() (Config, DumpOptions) {
@@ -161,15 +172,15 @@ func readConfigFile(filepath string) Config {
 }
 
 type ColumnSchema struct {
-	Type *types.FieldType
+	Type  *types.FieldType
 	Index int
-	Name string
+	Name  string
 }
 
 type columnMap map[int]ColumnSchema
 
-func (c columnMap) GetByName(name string) (ColumnSchema, error)  {
-	for i:= range c {
+func (c columnMap) GetByName(name string) (ColumnSchema, error) {
+	for i := range c {
 		if c[i].Name == name {
 			return c[i], nil
 		}
@@ -179,7 +190,7 @@ func (c columnMap) GetByName(name string) (ColumnSchema, error)  {
 
 type TableSchema struct {
 	Columns columnMap
-	Name string
+	Name    string
 }
 
 var schemaMapLock = sync.Mutex{}
@@ -189,14 +200,14 @@ func processCreateTableStatement(stmt *ast.CreateTableStmt) {
 	tableName := stmt.Table.Name.String()
 	schema := TableSchema{
 		Columns: make(columnMap),
-		Name: tableName,
+		Name:    tableName,
 	}
-	for i:= range stmt.Cols {
+	for i := range stmt.Cols {
 		col := stmt.Cols[i]
 		schema.Columns[i] = ColumnSchema{
-			Type: col.Tp,
+			Type:  col.Tp,
 			Index: i,
-			Name: col.Name.String(),
+			Name:  col.Name.String(),
 		}
 	}
 	schemaMapLock.Lock()
@@ -207,117 +218,55 @@ func processCreateTableStatement(stmt *ast.CreateTableStmt) {
 func mapInsertRowToColumns(insertRow []ast.ExprNode, tableSchema TableSchema) transformations.MappedRow {
 	result := make(transformations.MappedRow)
 	for i := range insertRow {
-		field := insertRow[i].(ast.ValueExpr)
+		field, ok := insertRow[i].(ast.ValueExpr)
+		if !ok {
+			fmt.Println("haa")
+		}
 		column := tableSchema.Columns[i]
 		result[column.Name] = field.GetValue()
 	}
 	return result
 }
 
-type wrappedRow struct {
-	rowIndex int
-	rowData []ast.ExprNode
-}
-
-type wrappedColumn struct {
-	columnIndex int
-	columnData ast.ExprNode
-	mappedRow transformations.MappedRow
-	columnSchema ColumnSchema
-}
-
-func processInsertStatement(stmt *ast.InsertStmt,  originalSql string, allTransforms map[string][]TableTransform) (string) {
+func processInsertStatement(stmt *ast.InsertStmt, tableConfig TableConfig) string {
 	tableName := stmt.Table.TableRefs.Left.(*ast.TableSource).Source.(*ast.TableName).Name.String()
-	schema := tableSchemas[tableName]
-	tableTransforms, ok := allTransforms[tableName]
-	if !ok {
-		return originalSql
+	schema, schemaFound := tableSchemas[tableName]
+	if !schemaFound {
+		panic(tableName)
 	}
 	allInsertRows := stmt.Lists
-	todoRows := make(chan wrappedRow, 16)
-	readyRows := make(chan wrappedRow, 16)
-	rowMutex := sync.RWMutex{}
-	rowProcessors := 4
-	processorWg := sync.WaitGroup{}
-
-	for i := 0; i<rowProcessors; i++ {
-		go func() {
-			processorWg.Add(1)
-			for currentRow := range todoRows {
-				mappedRow := mapInsertRowToColumns(currentRow.rowData, schema)
-				unwrappedRow := currentRow.rowData
-				for columnIdx := range unwrappedRow {
-					columnSchema, _ := schema.Columns[columnIdx]
-					currentColumn := unwrappedRow[columnIdx]
-					for i:=range tableTransforms {
-						currentTransform := tableTransforms[i]
-						rowTransformationFunc, rowTransformationFound := rowTransformationsMap[currentTransform.Type]
-						fieldTransformationFunc, fieldTransformationFound := fieldTransformationsMap[currentTransform.Type]
-						if !rowTransformationFound && !fieldTransformationFound {
-							panic("unknown transformation")
-						}
-						if columnSchema.Name != currentTransform.Field {
-							continue
-						}
-						var transformedValue interface{}
-						if rowTransformationFound {
-							transformedValue = rowTransformationFunc(mappedRow, currentTransform.Options)
-						}
-						if fieldTransformationFound {
-							transformedValue = fieldTransformationFunc(currentColumn.(ast.ValueExpr), currentTransform.Options)
-						}
-						unwrappedRow[columnIdx] = ast.NewValueExpr(transformedValue, mysql.UTF8Charset, mysql.UTF8Charset)
-					}
-				}
-				readyRows <- currentRow
+	for currentRowIndex := range allInsertRows {
+		currentRow := allInsertRows[currentRowIndex]
+		mappedRow := mapInsertRowToColumns(currentRow, schema)
+		for columnIdx := range currentRow {
+			columnSchema, _ := schema.Columns[columnIdx]
+			currentColumn := currentRow[columnIdx]
+			columnConfig := tableConfig.GetColumnConfigByName(columnSchema.Name)
+			for i := range columnConfig.Transformations {
+				currentTransform := columnConfig.Transformations[i]
+				var transformedValue interface{}
+				transformedValue = currentTransform.Function(mappedRow, currentColumn.(ast.ValueExpr))
+				currentRow[columnIdx] = ast.NewValueExpr(transformedValue, mysql.UTF8Charset, mysql.UTF8Charset)
 			}
-			processorWg.Done()
-		}()
-	}
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		for row := range readyRows {
-			rowMutex.Lock()
-			allInsertRows[row.rowIndex] = row.rowData
-			rowMutex.Unlock()
 		}
-		wg.Done()
-	}()
-
-	// ALL ROWS PROCESSOR
-	for i := range allInsertRows {
-		rowMutex.RLock()
-		currentRow := allInsertRows[i]
-		rowMutex.RUnlock()
-		rowForTrans := wrappedRow{
-			rowIndex: i,
-			rowData:  currentRow,
-		}
-		todoRows <- rowForTrans
 	}
-	close(todoRows)
-	processorWg.Wait()
-	close(readyRows)
-	wg.Wait()
 	buf := new(bytes.Buffer)
 	err := stmt.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, buf))
 	if err != nil {
 		panic(err)
 	}
-	return buf.String()+";"
+	return buf.String() + ";"
 }
 
 type orderedLine struct {
 	order int
-	line string
+	line  string
 }
 
 type statementType string
 
 const statementTypeInsert statementType = "insert"
 const statementTypeCreateTable statementType = "createTable"
-const statementTypeComment statementType = "comment"
 
 type preparsedStatement interface {
 	GetType() string
@@ -351,31 +300,17 @@ func (p preparsedInsertStmt) GetType() string {
 	return "insert"
 }
 
-type preparsedCommentStmt struct {}
-
-func (p preparsedCommentStmt) GetType() string {
-	return "comment"
-}
-
-type preparseResult struct {
-	tableName string
-	statementType statementType
-}
-
 var preparseRegexps = map[statementType]*regexp.Regexp{
-	statementTypeComment: regexp.MustCompile(`^--`),
-	statementTypeInsert: regexp.MustCompile(`(?m)^(?:\/\*!\d+ )?INSERT(?: (?:LOWPRIORITY|DELAYED|HIGH_PRIORITY))?(?: IGNORE)? INTO \x60?(\w+)\x60?`),
-	statementTypeCreateTable: regexp.MustCompile(`(?m)^(?:\/\*!\d+ )?CREATE(?: TEMPORARY)? TABLE (?: TEMPORARY)? \x60?(\w+)\x60?`),
+	statementTypeInsert:      regexp.MustCompile(`(?m)^(?:/\*!\d+ )?INSERT(?: (?:LOWPRIORITY|DELAYED|HIGH_PRIORITY))?(?: IGNORE)? INTO \x60?(\w+)\x60?`),
+	statementTypeCreateTable: regexp.MustCompile(`(?m)^(?:/\*!\d+ )?CREATE(?: TEMPORARY)? TABLE(?: IF NOT EXISTS)? \x60?(\w+)\x60?`),
 }
 
 func preparse(line string) preparsedStatement {
 	for statementType := range preparseRegexps {
 		expression := preparseRegexps[statementType]
 		matches := expression.FindStringSubmatch(line)
-		if len(matches) > 0  {
+		if len(matches) > 0 {
 			switch statementType {
-			case statementTypeComment:
-				return preparsedCommentStmt{}
 			case statementTypeCreateTable:
 				return preparsedCreateStmt{tableName: matches[1]}
 			case statementTypeInsert:
@@ -387,68 +322,70 @@ func preparse(line string) preparsedStatement {
 }
 
 func processInput(input io.Reader, config Config) chan orderedLine {
-	commentRegex := regexp.MustCompile("^--")
+
 	outputLines := make(chan orderedLine)
 	r := bufio.NewReaderSize(input, 2*1024*1024)
-	statementsForProcessing := make(chan orderedLine)
-	wg := sync.WaitGroup{}
-	for i:=0;i<16;i++ {
+	linesForProcessing := make(chan orderedLine)
+	lineProcessorsWg := sync.WaitGroup{}
+	for i := 0; i < 16; i++ {
 		go func() {
-			wg.Add(1)
+			lineProcessorsWg.Add(1)
 			p := parser.New()
-			for currentOrderedLine := range statementsForProcessing {
-				currentStatementLine := currentOrderedLine.line
-				processedLine := func() orderedLine {
+			for currentLine := range linesForProcessing {
+				currentStatementLine := currentLine.line
+				currentLine.line = func() string {
+					var tableName string
 					preparseResult := preparse(currentStatementLine)
 					switch preparseResult.(type) {
 					case nil:
-					case preparsedCommentStmt:
-						return currentOrderedLine
-					case preparsedInsertStmt:
-					case preparsedCreateStmt:
-						if _, transformExists := config.TableTransforms[preparseResult.(preparsedStatementWithTable).GetTableName()]; !transformExists {
-							return currentOrderedLine
+						return currentStatementLine
+					case preparsedStatementWithTable:
+						tableName = preparseResult.(preparsedStatementWithTable).GetTableName()
+						if len(config.GetTableConfig(tableName).Columns) == 0 {
+							return currentStatementLine
 						}
 					}
 					parseResult, warnings, err := p.Parse(currentStatementLine, mysql.UTF8Charset, mysql.UTF8Charset)
 					if err != nil {
-						return currentOrderedLine
+						return currentStatementLine
 					}
-					if len(warnings) >0 {
+					if len(warnings) > 0 {
 						fmt.Println(warnings)
 					}
+					if len(parseResult) == 0 {
+						fmt.Println("BAD")
+					}
 					statement := parseResult[0]
-					result := currentStatementLine
 					switch statement.(type) {
 					case *ast.InsertStmt:
-						result = processInsertStatement(statement.(*ast.InsertStmt), currentStatementLine, config.TableTransforms)
+						return processInsertStatement(statement.(*ast.InsertStmt), config.GetTableConfig(tableName))
 					case *ast.CreateTableStmt:
 						processCreateTableStatement(statement.(*ast.CreateTableStmt))
 					}
-					return orderedLine{
-						line: result + "\n",
-						order: currentOrderedLine.order,
-					}
+					return currentStatementLine
 				}()
-				outputLines <- processedLine
+				outputLines <- currentLine
 				currentStatementLine = ""
 			}
-			wg.Done()
+			lineProcessorsWg.Done()
 		}()
 	}
 	lineOrder := 0
-	pushLine := func(line string, output chan orderedLine) {
-		output <- orderedLine{
+
+	pushLine := func(line string) {
+		linesForProcessing <- orderedLine{
 			order: lineOrder,
-			line: line,
+			line:  line,
 		}
 		lineOrder++
 	}
+
+	// line reader
 	go func() {
 		currentStatementLine := ""
 		defer func() {
-			close(statementsForProcessing)
-			wg.Wait()
+			close(linesForProcessing)
+			lineProcessorsWg.Wait()
 			close(outputLines)
 		}()
 		for {
@@ -460,14 +397,14 @@ func processInput(input io.Reader, config Config) chan orderedLine {
 				break
 			}
 			line = strings.TrimSpace(line)
-			if commentRegex.MatchString(line) || len(line) == 0 {
-				pushLine(line+"\n", outputLines)
+			if len(line) == 0 {
+				pushLine(line)
 				continue
 			}
-			currentStatementLine += line+"\n"
+			currentStatementLine += line + "\n"
 			lastCharacter := line[len(line)-1:]
 			if lastCharacter == ";" {
-				pushLine(currentStatementLine, statementsForProcessing)
+				pushLine(currentStatementLine)
 				currentStatementLine = ""
 			} else {
 				continue
