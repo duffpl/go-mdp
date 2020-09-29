@@ -18,9 +18,4 @@ func init() {
 	}
 }
 
-func stringMd5(input string) string {
-	h := md5.New()
-	h.Write([]byte(input))
-	return fmt.Sprintf("%x", h.Sum(nil))
-}
 

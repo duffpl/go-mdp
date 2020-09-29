@@ -2,31 +2,27 @@ package transformations
 
 import (
 	"encoding/json"
+	"fmt"
 	"github.com/pingcap/parser/ast"
 )
 
-type transformationFactory func(rawOptions json.RawMessage) TranformationFunction
-type TranformationFunction func(row MappedRow, fieldValue ast.ValueExpr) interface{}
+type ColumnTransformationInitializer func(rawOptions json.RawMessage) (ColumnTransformationFunction, error)
+type ColumnTransformationFunction func(row MappedRow, fieldValue ast.ValueExpr) (interface{}, error)
 
-var factories = make(map[ColumnTransformationType]transformationFactory)
+var columnTransformationInitializers = make(map[ColumnTransformationType]ColumnTransformationInitializer)
 
-func init() {
-	factories[templateTransformationType] = func(rawOptions json.RawMessage) TranformationFunction {
-		templateOptions := &TemplateOptions{}
-		json.Unmarshal(rawOptions, templateOptions)
-		return func(row MappedRow, fieldValue ast.ValueExpr) interface{} {
-			return TransformRowTemplate(row, fieldValue, *templateOptions)
-		}
-	}
-	factories[valueTransformationType] = func(rawOptions json.RawMessage) TranformationFunction {
-		options := &ValueOptions{}
-		json.Unmarshal(rawOptions, options)
-		return func(row MappedRow, fieldValue ast.ValueExpr) interface{} {
-			return TransformFieldValue(fieldValue, *options)
-		}
-	}
+func RegisterColumnTransformation(t ColumnTransformationType, c ColumnTransformationInitializer) {
+	columnTransformationInitializers[t] = c
 }
 
-func GetTransformation(t ColumnTransformationType, opts json.RawMessage) TranformationFunction {
-	return factories[t](opts)
+func GetColumnTransformation(t ColumnTransformationType, opts json.RawMessage) (ColumnTransformationFunction, error) {
+	transformFunctionInitializer, transformFound := columnTransformationInitializers[t]
+	if !transformFound {
+		return nil, fmt.Errorf("transformation initializer for '%s' doesn't exist", t)
+	}
+	transformFunction, err := transformFunctionInitializer(opts)
+	if err != nil {
+		return nil, fmt.Errorf("cannot initialize '%s': %w", t, err)
+	}
+	return transformFunction, nil
 }
