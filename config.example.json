@@ -9,7 +9,7 @@
             {
               "type": "template",
               "options": {
-                "template": "user-{{ .Row.id }}@opinahjo.fi"
+                "template": "user-{{ .Row.id }}@example.com"
               }
             }
           ]
@@ -42,7 +42,7 @@
             {
               "type": "value",
               "options": {
-                "value": "$2y$15$vrgRgR4mhjfOWEO/iNkac.y3n8HaAhcb2tY3OgVy0GWBfod8Wk2Pu"
+                "value": "pwd"
               }
             }
           ]

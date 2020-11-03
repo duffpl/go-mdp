@@ -12,9 +12,12 @@ import (
 	"github.com/pingcap/parser/format"
 	"github.com/pingcap/parser/mysql"
 	_ "github.com/pingcap/tidb/types/parser_driver"
+	"github.com/sirupsen/logrus"
 	"io"
 	"io/ioutil"
+	"os"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 )
@@ -166,22 +169,14 @@ func preparse(line string) preparsedStatement {
 	}
 	return nil
 }
-func readStatements(input io.Reader, ctx context.Context) (chan OrderedLine, chan error) {
-	linesCh := make(chan OrderedLine)
+func readStatements(input io.Reader, ctx context.Context) (chan string, chan error) {
+	outputCh := make(chan string, 100)
 	bufferedInput := bufio.NewReader(input)
 	errCh := make(chan error)
-	currentLineOrder := 0
-	writeLine := func(line string) {
-		linesCh <- OrderedLine{
-			Order: currentLineOrder,
-			Line:  line,
-		}
-		currentLineOrder++
-	}
 	go func() {
 		currentStatementLine := ""
 		defer func() {
-			close(linesCh)
+			close(outputCh)
 			close(errCh)
 		}()
 		for {
@@ -199,21 +194,23 @@ func readStatements(input io.Reader, ctx context.Context) (chan OrderedLine, cha
 			}
 			line = strings.TrimSpace(line)
 			if len(line) == 0 {
-				writeLine(line)
+				outputCh <- line
 				continue
 			}
 			currentStatementLine += line + "\n"
 			lastCharacter := line[len(line)-1:]
 			if lastCharacter == ";" {
-				writeLine(currentStatementLine)
+				outputCh <- currentStatementLine
 				currentStatementLine = ""
 			} else {
 				continue
 			}
 		}
 	}()
-	return linesCh, errCh
+	return outputCh, errCh
 }
+
+var kibel, _ = os.Create("/tmp/kibel2.sql")
 
 func (p Processor) processLine(line string, parser *parser.Parser) (string, error) {
 	var tableName string
@@ -242,11 +239,29 @@ func (p Processor) processLine(line string, parser *parser.Parser) (string, erro
 	return line, nil
 }
 
-func (p Processor) processLines(linesForProcessing chan OrderedLine, ctx context.Context) (chan OrderedLine, chan error) {
-	outputLines := make(chan OrderedLine)
+type lineWithOutputChannel struct {
+	line          string
+	outputChannel chan string
+}
+
+func (p Processor) processLines(input chan string, ctx context.Context) (chan chan string, chan error) {
+	outputCh := make(chan chan string, 100)
 	errCh := make(chan error)
+	linesForProcessing := make(chan lineWithOutputChannel, 100)
+	processorCount := runtime.NumCPU()
 	lineProcessorsWg := sync.WaitGroup{}
-	for i := 0; i < 16; i++ {
+	go func() {
+		for line := range input {
+			processedCh := make(chan string)
+			outputCh <- processedCh
+			linesForProcessing <- lineWithOutputChannel{
+				line:          line,
+				outputChannel: processedCh,
+			}
+		}
+		close(linesForProcessing)
+	}()
+	for i := 0; i < processorCount; i++ {
 		go func() {
 			defer func() {
 				lineProcessorsWg.Done()
@@ -259,41 +274,65 @@ func (p Processor) processLines(linesForProcessing chan OrderedLine, ctx context
 					return
 				default:
 				}
-				currentStatementLine := currentLine.Line
-				processedLine, err := p.processLine(currentStatementLine, stmtParser)
+				processedLine, err := p.processLine(currentLine.line, stmtParser)
 				if err != nil {
 					errCh <- err
 					return
 				}
-				currentLine.Line = processedLine
-				outputLines <- currentLine
-				currentStatementLine = ""
+				currentLine.outputChannel <- processedLine
 			}
 		}()
 	}
 	go func() {
 		lineProcessorsWg.Wait()
-		close(outputLines)
+		close(outputCh)
 		close(errCh)
 	}()
-	return outputLines, errCh
+	return outputCh, errCh
 }
 
-func (p Processor) ProcessInput(input io.Reader, ctx context.Context) (chan OrderedLine, chan error) {
-	errCh := make(chan error)
+var log logrus.FieldLogger = logrus.New()
+
+func SetLogger(logger logrus.FieldLogger) {
+	log = logger
+}
+
+func (p Processor) Process(input io.Reader, output io.Writer, pCtx context.Context) error {
+	ctx, cancelCtx := context.WithCancel(pCtx)
 	linesForProcessing, inputErrors := readStatements(input, ctx)
 	processedLines, processingErrors := p.processLines(linesForProcessing, ctx)
+	var err error
 	go func() {
-		select {
-		case err := <-inputErrors:
-			if err != nil {
-				errCh <- fmt.Errorf("input error: %w", err)
-			}
-		case err := <-processingErrors:
-			if err != nil {
-				errCh <- fmt.Errorf("processing error: %w", err)
+		defer func() {
+			cancelCtx()
+		}()
+		for {
+			select {
+			case processedLineCh, ok := <-processedLines:
+				if !ok {
+					return
+				}
+				processedLine := <-processedLineCh
+				_, err = output.Write([]byte(processedLine))
+				if err != nil {
+					return
+				}
+			case err = <-inputErrors:
+				if err != nil {
+					err = fmt.Errorf("input error: %w", err)
+					return
+				}
+			case err := <-processingErrors:
+				if err != nil {
+					err = fmt.Errorf("processing error: %w", err)
+					return
+				}
 			}
 		}
 	}()
-	return processedLines, errCh
+	<-ctx.Done()
+	if p.config.PostSQL != "" {
+		_, err = output.Write([]byte(p.config.PostSQL))
+	}
+	return err
 }
