@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,12 +17,20 @@ package cmd
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"github.com/duffpl/go-mdp/config"
+	"github.com/duffpl/go-mdp/faker"
 	"github.com/duffpl/go-mdp/processor"
+	"github.com/duffpl/go-mdp/templates"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"io"
+	"io/ioutil"
 	"os"
 )
 
@@ -47,8 +55,7 @@ to quickly create a Cobra application.`,
 		if err != nil {
 			return fmt.Errorf("cannot create output stream: %w", err)
 		}
-		configFilename := cmd.Flag(FlagNameConfig).Value.String()
-		p, err := processor.NewProcessorWithConfigFile(configFilename)
+		p, err := initProcessor(cmd)
 		if err != nil {
 			return fmt.Errorf("cannot create processor: %w", err)
 		}
@@ -57,6 +64,62 @@ to quickly create a Cobra application.`,
 		processor.SetLogger(l)
 		return p.Process(input, output, context.Background())
 	},
+}
+
+func initProcessor(cmd *cobra.Command) (*processor.Processor, error) {
+	var configData []byte
+	flagConfigData, err := cmd.Flags().GetString(FlagNameConfigData)
+	if err != nil {
+		return nil, fmt.Errorf("cannot get config data flag: %w", err)
+	}
+	if flagConfigData != "" {
+		configData, err = base64.StdEncoding.DecodeString(flagConfigData)
+		if err != nil {
+			return nil, fmt.Errorf("cannot decode config data: %w", err)
+		}
+		isConfigDataZipped, err := cmd.Flags().GetBool(FlagNameConfigIsZipped)
+		if err != nil {
+			return nil, fmt.Errorf("cannot get is config zipped flag: %w", err)
+		}
+		if isConfigDataZipped {
+			gr, err := gzip.NewReader(bytes.NewBuffer(configData))
+			if err != nil {
+				return nil, fmt.Errorf("cannot create gzip reader: %w", err)
+			}
+			configData, err = ioutil.ReadAll(gr)
+			if err != nil {
+				return nil, fmt.Errorf("cannot read gzip data: %w", err)
+			}
+		}
+	} else {
+		configFilename, err := cmd.Flags().GetString(FlagNameConfig)
+		if err != nil {
+			return nil, fmt.Errorf("cannot read config filename flag: %w", err)
+		}
+		configData, err = ioutil.ReadFile(configFilename)
+		if err != nil {
+			return nil, fmt.Errorf("cannot read config file: %w", err)
+		}
+	}
+	configObject := &config.Config{}
+	err = json.Unmarshal(configData, configObject)
+	if err != nil {
+		return nil, fmt.Errorf("cannot unmarshal config json data: %w", err)
+	}
+	f := faker.Faker{
+		Locale: configObject.Settings.Locale,
+	}
+	templates.RegisterTemplateFuncs(f.FuncMap())
+	p, err := processor.NewProcessorWithConfig(*configObject)
+	if err != nil {
+		return nil, fmt.Errorf("cannot create processor with config json data: %w", err)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("cannot create processor with config json data: %w", err)
+	}
+	//transformations.RegisterColumnTransformations()
+	return p, nil
 }
 
 func getInputStream(filename string) (io.Reader, error) {
@@ -91,9 +154,11 @@ func Execute() {
 }
 
 var (
-	FlagNameInput  = "input"
-	FlagNameOutput = "output"
-	FlagNameConfig = "config"
+	FlagNameInput          = "input"
+	FlagNameOutput         = "output"
+	FlagNameConfig         = "config"
+	FlagNameConfigData     = "config-data"
+	FlagNameConfigIsZipped = "config-zipped"
 )
 
 func init() {
@@ -107,6 +172,8 @@ func init() {
 	rootCmd.Flags().StringP(FlagNameInput, "i", "", "input file (if not set stdin is used)")
 	rootCmd.Flags().StringP(FlagNameOutput, "o", "", "output file (if not set stdout is used)")
 	rootCmd.Flags().StringP(FlagNameConfig, "c", "config.json", "config file")
+	rootCmd.Flags().StringP(FlagNameConfigData, "f", "", "encoded config file")
+	rootCmd.Flags().BoolP(FlagNameConfigIsZipped, "z", false, "is encoded config data zipped?")
 
 	// Cobra also supports local flags, which will only run
 	// when this action is called directly.

@@ -3,11 +3,7 @@ package transformations
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/pingcap/parser/ast"
 )
-
-type ColumnTransformationInitializer func(rawOptions json.RawMessage) (ColumnTransformationFunction, error)
-type ColumnTransformationFunction func(row MappedRow, fieldValue ast.ValueExpr) (interface{}, error)
 
 var columnTransformationInitializers = make(map[ColumnTransformationType]ColumnTransformationInitializer)
 
@@ -15,12 +11,12 @@ func RegisterColumnTransformation(t ColumnTransformationType, c ColumnTransforma
 	columnTransformationInitializers[t] = c
 }
 
-func GetColumnTransformation(t ColumnTransformationType, opts json.RawMessage) (ColumnTransformationFunction, error) {
+func GetColumnTransformation(t ColumnTransformationType, opts json.RawMessage, additionalOptions any) (ColumnTransformationFunction, error) {
 	transformFunctionInitializer, transformFound := columnTransformationInitializers[t]
 	if !transformFound {
 		return nil, fmt.Errorf("transformation initializer for '%s' doesn't exist", t)
 	}
-	transformFunction, err := transformFunctionInitializer(opts)
+	transformFunction, err := transformFunctionInitializer(opts, additionalOptions)
 	if err != nil {
 		return nil, fmt.Errorf("cannot initialize '%s': %w", t, err)
 	}
