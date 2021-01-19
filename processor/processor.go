@@ -14,7 +14,6 @@ import (
 	_ "github.com/pingcap/tidb/types/parser_driver"
 	"github.com/sirupsen/logrus"
 	"io"
-	"io/ioutil"
 	"os"
 	"regexp"
 	"runtime"
@@ -26,13 +25,9 @@ type Processor struct {
 	config Config
 }
 
-func NewProcessorWithConfigFile(path string) (*Processor, error) {
-	configData, err := ioutil.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("cannot read config file: %w", err)
-	}
+func NewProcessorWithConfigJSON(configJson []byte) (*Processor, error) {
 	config := &Config{}
-	err = json.Unmarshal(configData, config)
+	err := json.Unmarshal(configJson, config)
 	if err != nil {
 		return nil, fmt.Errorf("cannot unmarshal config: %w", err)
 	}
@@ -40,6 +35,7 @@ func NewProcessorWithConfigFile(path string) (*Processor, error) {
 		config: *config,
 	}, nil
 }
+
 
 func NewProcessor(config Config) Processor {
 	return Processor{
