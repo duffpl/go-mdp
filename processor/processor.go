@@ -29,8 +29,20 @@ type Processor struct {
 	globalVariables      map[string]string
 }
 
+var tableRowCounterMutex = &sync.Mutex{}
+var tableRowCounterMap = make(map[string]int)
+
 func NewProcessorWithConfig(configData config.Config) (*Processor, error) {
 	return NewProcessor(configData)
+}
+
+func incrementTableCounter(tableName string) int {
+	tableRowCounterMutex.Lock()
+	defer tableRowCounterMutex.Unlock()
+	counter := tableRowCounterMap[tableName]
+	counter++
+	tableRowCounterMap[tableName] = counter
+	return counter
 }
 
 func NewProcessor(config config.Config) (*Processor, error) {
@@ -108,13 +120,14 @@ func processInsertStatement(stmt *ast.InsertStmt, tableConfig *PreparedTableConf
 	}
 	allInsertRows := stmt.Lists
 	for currentRowIndex := range allInsertRows {
+		tableRowIndex := incrementTableCounter(tableName)
 		currentRow := allInsertRows[currentRowIndex]
 		mappedRow, err := mapInsertRowToColumns(currentRow, schema)
 		if err != nil {
 			return "", fmt.Errorf("cannot map row: %w", err)
 		}
 		rowMeta := transformations.RowMeta{
-			Index: currentRowIndex + 1,
+			Index: tableRowIndex,
 		}
 		rowData := &rowTemplateData{
 			Row:             mappedRow,
@@ -131,10 +144,12 @@ func processInsertStatement(stmt *ast.InsertStmt, tableConfig *PreparedTableConf
 		if err != nil {
 			return "", fmt.Errorf("cannot render row variables: %w", err)
 		}
+
 		for columnIdx := range currentRow {
 			columnSchema, _ := schema.Columns[columnIdx]
 			currentColumn := currentRow[columnIdx]
 			columnTemplates, ok := tableConfig.ColumnTemplates[columnSchema.Name]
+
 			if !ok {
 				continue
 			}
@@ -503,7 +518,6 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 				}
 				columnTemplates[colName] = make([]*templates.Template, templateCount)
 			}
-
 			allCompiledTemplates, err := templates.CompileAllTemplates(allTemplates)
 			if err != nil {
 				return nil, fmt.Errorf("cannot compile all templates: %w", err)
@@ -512,10 +526,6 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 			if err != nil {
 				return nil, fmt.Errorf("cannot get dependency stack: %w", err)
 			}
-
-			//filteredStack := slices.Filter(dependencyStack, func(template *templates.Template) bool {
-			//	return !slices.Contains(templatesForDependencyStack, template.Name)
-			//})
 			var tableVariablesTemplates []*templates.Template
 			var rowVariableTemplates []*templates.Template
 			columnVariableTemplates := make(map[string]*templates.Template)
@@ -555,25 +565,6 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 		result[tableConfig.TableName] = preparedTableConfig
 	}
 	return result, nil
-}
-
-func compileColumnTemplates(configData config.Config, tableConfig config.TableConfig) ([]*templates.Template, error) {
-	mergedColumnVariableTemplates := make(map[string]config.Template)
-	for name, tmpl := range configData.ColumnVariables {
-		mergedColumnVariableTemplates[name] = tmpl
-	}
-	for name, tmpl := range tableConfig.ColumnVariables {
-		mergedColumnVariableTemplates[name] = tmpl
-	}
-	compiledColumnVariableTemplates, err := templates.CompileTemplates(mergedColumnVariableTemplates, "ColumnVariables")
-	if err != nil {
-		return nil, fmt.Errorf("cannot compile column variables templates: %w", err)
-	}
-	orderedColumnTemplates, err := templates.GetOrderedTemplates(compiledColumnVariableTemplates)
-	if err != nil {
-		return nil, fmt.Errorf("cannot resolve column variables order: %w", err)
-	}
-	return orderedColumnTemplates, nil
 }
 
 func renderTableVariables(
@@ -624,24 +615,4 @@ func renderGlobalVariables(configData config.Config) (map[string]string, error) 
 	}
 
 	return globalVariables, nil
-}
-
-func compileRowTemplates(configData config.Config, tableConfig config.TableConfig, preparedTableConfig *PreparedTableConfig) error {
-	rowTemplates := make(map[string]config.Template, len(configData.RowVariables))
-	for name, tmpl := range configData.RowVariables {
-		rowTemplates[name] = tmpl
-	}
-	for name, tmpl := range tableConfig.RowVariables {
-		rowTemplates[name] = tmpl
-	}
-	compiledRowTemplates, err := templates.CompileTemplates(rowTemplates, "RowVariables")
-	if err != nil {
-		return fmt.Errorf("cannot compile row templates: %w", err)
-	}
-	orderedRowTemplates, err := templates.GetOrderedTemplates(compiledRowTemplates)
-	if err != nil {
-		return fmt.Errorf("cannot calculate row templates render order: %w", err)
-	}
-	preparedTableConfig.RowVariableTemplates = orderedRowTemplates
-	return nil
 }

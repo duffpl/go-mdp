@@ -160,50 +160,21 @@ func GetDependencyStackForMultipleTemplates(templateNames []string, templates ma
 	return stack, nil
 }
 
-func GetDependencyStack(templateName string, templates map[string]*Template) ([]*Template, error) {
-	var stack []*Template
-	visited := make(map[string]bool)
-
-	// Check if the template exists
-	template, exists := templates[templateName]
-	if !exists {
-		return nil, fmt.Errorf("template %s does not exist", templateName)
-	}
-
-	// Start depth-first search
-	err := dfs(template, templates, &stack, visited)
-	if err != nil {
-		return nil, err
-	}
-
-	return stack, nil
-}
-
 func dfs(template *Template, templates map[string]*Template, stack *[]*Template, visited map[string]bool) error {
-	// Check if the template is already visited
 	if visited[template.Name] {
 		return nil
 	}
-
-	// Mark the template as visited
 	visited[template.Name] = true
-
-	// Visit each of the template's dependencies
 	for _, dep := range template.Dependencies {
-		// Check if the dependency exists
 		depTemplate, exists := templates[dep.Name]
 		if !exists {
 			return fmt.Errorf("template %s depends on %s, but %s does not exist", template.Name, dep.Name, dep.Name)
 		}
-
-		// Recursively call dfs on the dependency
 		err := dfs(depTemplate, templates, stack, visited)
 		if err != nil {
 			return err
 		}
 	}
-
-	// Add the template to the stack
 	*stack = append(*stack, template)
 
 	return nil
