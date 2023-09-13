@@ -1,10 +1,9 @@
 package faker
 
 import (
-	"crypto/sha256"
 	_ "embed"
-	"encoding/binary"
 	"encoding/json"
+	"hash/fnv"
 	"html/template"
 	"math/rand"
 	"strconv"
@@ -137,7 +136,7 @@ func TransformCompanyName(input string, locale string) string {
 }
 
 func initRng(input string) *rand.Rand {
-	hash := sha256.Sum256([]byte(input))
-	seed := binary.BigEndian.Uint64(hash[:8])
-	return rand.New(rand.NewSource(int64(seed)))
+	h := fnv.New64a()
+	h.Write([]byte(input))
+	return rand.New(rand.NewSource(int64(h.Sum64())))
 }
