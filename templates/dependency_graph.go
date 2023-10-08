@@ -2,7 +2,7 @@ package templates
 
 import (
 	"fmt"
-	"github.com/duffpl/go-mdp/config"
+	"github.com/duffpl/go-mdp/v2/config"
 	"golang.org/x/exp/slices"
 	"regexp"
 	"text/template/parse"
