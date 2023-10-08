@@ -1,4 +1,4 @@
-module github.com/duffpl/go-mdp
+module github.com/duffpl/go-mdp/v2
 
 go 1.20
 
