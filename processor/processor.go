@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
+	"github.com/bobg/go-generics/v2/slices"
+	"github.com/duffpl/go-mdp/config"
+	"github.com/duffpl/go-mdp/templates"
 	"github.com/duffpl/go-mdp/transformations"
 	"github.com/pingcap/parser"
 	"github.com/pingcap/parser/ast"
@@ -14,33 +16,51 @@ import (
 	_ "github.com/pingcap/tidb/types/parser_driver"
 	"github.com/sirupsen/logrus"
 	"io"
-	"os"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 )
 
 type Processor struct {
-	config Config
+	Config               config.Config
+	tableTransformations map[string]*PreparedTableConfig
+	globalVariables      map[string]string
 }
 
-func NewProcessorWithConfigJSON(configJson []byte) (*Processor, error) {
-	config := &Config{}
-	err := json.Unmarshal(configJson, config)
+var tableRowCounterMutex = &sync.Mutex{}
+var tableRowCounterMap = make(map[string]int)
+
+func NewProcessorWithConfig(configData config.Config) (*Processor, error) {
+	return NewProcessor(configData)
+}
+
+func incrementTableCounter(tableName string) int {
+	tableRowCounterMutex.Lock()
+	defer tableRowCounterMutex.Unlock()
+	counter := tableRowCounterMap[tableName]
+	counter++
+	tableRowCounterMap[tableName] = counter
+	return counter
+}
+
+func NewProcessor(config config.Config) (*Processor, error) {
+	//transformations.RegisterColumnTransformations()
+	tableTransformations, err := prepareTableConfigs(config)
 	if err != nil {
-		return nil, fmt.Errorf("cannot unmarshal config: %w", err)
+		return nil, fmt.Errorf("unable to prepare transformations: %w", err)
 	}
-	return &Processor{
-		config: *config,
-	}, nil
-}
-
-
-func NewProcessor(config Config) Processor {
-	return Processor{
-		config: config,
+	p := &Processor{
+		Config:               config,
+		tableTransformations: tableTransformations,
 	}
+	globalVariables, err := p.renderGlobalVariables()
+	if err != nil {
+		return nil, fmt.Errorf("cannot render global variables: %w", err)
+	}
+	p.globalVariables = globalVariables
+	return p, nil
 }
 
 var schemaMapLock = sync.Mutex{}
@@ -65,6 +85,20 @@ func processCreateTableStatement(stmt *ast.CreateTableStmt) {
 	schemaMapLock.Unlock()
 }
 
+type rowTemplateData struct {
+	Row             transformations.MappedRow
+	RowMeta         transformations.RowMeta
+	RowVariables    map[string]string
+	GlobalVariables map[string]string
+	TableVariables  map[string]string
+}
+
+type columnTemplateData struct {
+	rowTemplateData
+	ColumnVariables map[string]string
+	FieldValue      interface{}
+}
+
 func mapInsertRowToColumns(insertRow []ast.ExprNode, tableSchema TableSchema) (transformations.MappedRow, error) {
 	result := make(transformations.MappedRow)
 	for i := range insertRow {
@@ -78,7 +112,7 @@ func mapInsertRowToColumns(insertRow []ast.ExprNode, tableSchema TableSchema) (t
 	return result, nil
 }
 
-func processInsertStatement(stmt *ast.InsertStmt, tableConfig TableConfig) (string, error) {
+func processInsertStatement(stmt *ast.InsertStmt, tableConfig *PreparedTableConfig) (string, error) {
 	tableName := stmt.Table.TableRefs.Left.(*ast.TableSource).Source.(*ast.TableName).Name.String()
 	schema, schemaFound := tableSchemas[tableName]
 	if !schemaFound {
@@ -86,22 +120,62 @@ func processInsertStatement(stmt *ast.InsertStmt, tableConfig TableConfig) (stri
 	}
 	allInsertRows := stmt.Lists
 	for currentRowIndex := range allInsertRows {
+		tableRowIndex := incrementTableCounter(tableName)
 		currentRow := allInsertRows[currentRowIndex]
 		mappedRow, err := mapInsertRowToColumns(currentRow, schema)
 		if err != nil {
 			return "", fmt.Errorf("cannot map row: %w", err)
 		}
+		rowMeta := transformations.RowMeta{
+			Index: tableRowIndex,
+		}
+		rowData := &rowTemplateData{
+			Row:             mappedRow,
+			RowMeta:         rowMeta,
+			RowVariables:    make(map[string]string),
+			GlobalVariables: tableConfig.GlobalVariables,
+			TableVariables:  tableConfig.TableVariables,
+		}
+		err = renderRowVariables(
+			tableConfig.RowVariableTemplates,
+			rowData,
+		)
+
+		if err != nil {
+			return "", fmt.Errorf("cannot render row variables: %w", err)
+		}
+
 		for columnIdx := range currentRow {
 			columnSchema, _ := schema.Columns[columnIdx]
 			currentColumn := currentRow[columnIdx]
-			columnConfig := tableConfig.GetColumnConfigByName(columnSchema.Name)
-			for i := range columnConfig.Transformations {
-				currentTransformation := columnConfig.Transformations[i]
-				transformedValue, err := currentTransformation.TransformationFunction(mappedRow, currentColumn.(ast.ValueExpr))
+			columnTemplates, ok := tableConfig.ColumnTemplates[columnSchema.Name]
+
+			if !ok {
+				continue
+			}
+			// render column templates
+			for _, tmpl := range columnTemplates {
+				if err != nil {
+					return "", fmt.Errorf("cannot get transformation function: %w", err)
+				}
+				columnVariablesTemplates := slices.Filter(tmpl.Dependencies, func(tmpl *templates.Template) bool {
+					return strings.HasPrefix(tmpl.Name, ".ColumnVariables")
+				})
+				columnData := &columnTemplateData{
+					rowTemplateData: *rowData,
+					FieldValue:      currentColumn.(ast.ValueExpr).GetString(),
+					ColumnVariables: make(map[string]string),
+				}
+				err = renderColumnVariables(columnVariablesTemplates, columnData)
+				if err != nil {
+					return "", fmt.Errorf("cannot render column variables: %w", err)
+				}
+				transformedValue := new(bytes.Buffer)
+				err := tmpl.CompiledTemplate.Execute(transformedValue, columnData)
 				if err != nil {
 					return "", fmt.Errorf("cannot apply transform: %w", err)
 				}
-				currentRow[columnIdx] = ast.NewValueExpr(transformedValue, mysql.UTF8Charset, mysql.UTF8Charset)
+				currentRow[columnIdx] = ast.NewValueExpr(transformedValue.String(), mysql.UTF8Charset, mysql.UTF8Charset)
 			}
 		}
 	}
@@ -111,6 +185,40 @@ func processInsertStatement(stmt *ast.InsertStmt, tableConfig TableConfig) (stri
 		return "", fmt.Errorf("cannot restore insert statement: %w", err)
 	}
 	return buf.String() + ";", nil
+}
+
+func renderRowVariables(
+	templates []*templates.Template,
+	data *rowTemplateData,
+) error {
+	result := make(map[string]string)
+	for _, tmpl := range templates {
+		output := new(bytes.Buffer)
+		err := tmpl.CompiledTemplate.Execute(output, data)
+		if err != nil {
+			return fmt.Errorf("cannot render variable '%s' template: %w", tmpl.Name, err)
+		}
+		shortName, _ := strings.CutPrefix(tmpl.Name, ".RowVariables.")
+		result[shortName] = output.String()
+		data.RowVariables = result
+	}
+	return nil
+}
+
+func renderColumnVariables(
+	templates []*templates.Template,
+	data *columnTemplateData,
+) error {
+	for _, tmpl := range templates {
+		output := new(bytes.Buffer)
+		err := tmpl.CompiledTemplate.Execute(output, data)
+		if err != nil {
+			return fmt.Errorf("cannot render variable '%s' template: %w", tmpl.Name, err)
+		}
+		shortName, _ := strings.CutPrefix(tmpl.Name, ".ColumnVariables.")
+		data.ColumnVariables[shortName] = output.String()
+	}
+	return nil
 }
 
 type preparsedStatement interface {
@@ -206,29 +314,30 @@ func readStatements(input io.Reader, ctx context.Context) (chan string, chan err
 	return outputCh, errCh
 }
 
-var kibel, _ = os.Create("/tmp/kibel2.sql")
-
 func (p Processor) processLine(line string, parser *parser.Parser) (string, error) {
 	var tableName string
-	config := p.config
 	preparseResult := preparse(line)
 	switch preparseResult.(type) {
 	case nil:
 		return line, nil
 	case preparsedStatementWithTable:
 		tableName = preparseResult.(preparsedStatementWithTable).GetTableName()
-		if len(config.GetTableConfigByName(tableName).Columns) == 0 {
-			return line, nil
-		}
+	}
+	tableTransformations, ok := p.tableTransformations[tableName]
+	if !ok {
+		return line, nil
 	}
 	parseResult, _, err := parser.Parse(line, mysql.UTF8Charset, mysql.UTF8Charset)
 	if err != nil {
-		return line, fmt.Errorf("cannot parse statement: %w", err)
+		return line, fmt.Errorf("cannot parse statement for table %s: %w", tableName, err)
 	}
 	statement := parseResult[0]
 	switch statement.(type) {
 	case *ast.InsertStmt:
-		return processInsertStatement(statement.(*ast.InsertStmt), config.GetTableConfigByName(tableName))
+		line, err = processInsertStatement(statement.(*ast.InsertStmt), tableTransformations)
+		if err != nil {
+			return line, fmt.Errorf("cannot process insert statement for table %s: %w", tableName, err)
+		}
 	case *ast.CreateTableStmt:
 		processCreateTableStatement(statement.(*ast.CreateTableStmt))
 	}
@@ -264,18 +373,22 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 			}()
 			lineProcessorsWg.Add(1)
 			stmtParser := parser.New()
-			for currentLine := range linesForProcessing {
+			for {
 				select {
 				case <-ctx.Done():
 					return
-				default:
+				case currentLine, ok := <-linesForProcessing:
+					if !ok {
+						return
+					}
+					processedLine, err := p.processLine(currentLine.line, stmtParser)
+					if err != nil {
+						currentLine.outputChannel <- fmt.Sprintf("/* error: %s */\n%s", err.Error(), currentLine.line)
+						errCh <- err
+						return
+					}
+					currentLine.outputChannel <- processedLine
 				}
-				processedLine, err := p.processLine(currentLine.line, stmtParser)
-				if err != nil {
-					errCh <- err
-					return
-				}
-				currentLine.outputChannel <- processedLine
 			}
 		}()
 	}
@@ -293,24 +406,22 @@ func SetLogger(logger logrus.FieldLogger) {
 	log = logger
 }
 
-func (p Processor) Process(input io.Reader, output io.Writer, pCtx context.Context) error {
+func (p Processor) Process(input io.Reader, output io.Writer, pCtx context.Context) (err error) {
 	ctx, cancelCtx := context.WithCancel(pCtx)
-	linesForProcessing, inputErrors := readStatements(input, ctx)
-	processedLines, processingErrors := p.processLines(linesForProcessing, ctx)
-	var err error
+	readLines, inputErrors := readStatements(input, ctx)
+	processedLinesChans, processingErrors := p.processLines(readLines, ctx)
 	go func() {
-		defer func() {
-			cancelCtx()
-		}()
+		defer cancelCtx()
 		for {
 			select {
-			case processedLineCh, ok := <-processedLines:
+			case processedLineCh, ok := <-processedLinesChans:
 				if !ok {
 					return
 				}
 				processedLine := <-processedLineCh
 				_, err = output.Write([]byte(processedLine))
 				if err != nil {
+					err = fmt.Errorf("output error: %w", err)
 					return
 				}
 			case err = <-inputErrors:
@@ -318,7 +429,7 @@ func (p Processor) Process(input io.Reader, output io.Writer, pCtx context.Conte
 					err = fmt.Errorf("input error: %w", err)
 					return
 				}
-			case err := <-processingErrors:
+			case err = <-processingErrors:
 				if err != nil {
 					err = fmt.Errorf("processing error: %w", err)
 					return
@@ -327,8 +438,181 @@ func (p Processor) Process(input io.Reader, output io.Writer, pCtx context.Conte
 		}
 	}()
 	<-ctx.Done()
-	if p.config.PostSQL != "" {
-		_, err = output.Write([]byte(p.config.PostSQL))
+	if p.Config.PostSQL != "" {
+		_, err = output.Write([]byte(p.Config.PostSQL))
 	}
 	return err
+}
+
+func (p Processor) renderGlobalVariables() (map[string]string, error) {
+	compiled, err := templates.CompileTemplates(p.Config.GlobalVariables, "TableVariables")
+	if err != nil {
+		return nil, fmt.Errorf("cannot compile global variables templates: %w", err)
+	}
+	ordered, err := templates.GetOrderedTemplates(compiled)
+	if err != nil {
+		return nil, fmt.Errorf("cannot resolve global variables order: %w", err)
+	}
+	result := make(map[string]string, len(ordered))
+	for _, tmpl := range ordered {
+		output := new(bytes.Buffer)
+		err := tmpl.CompiledTemplate.Execute(output, struct {
+			GlobalVariables map[string]string
+		}{
+			GlobalVariables: result,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("cannot render global variables template '%w': %w", tmpl.Name, err)
+		}
+		shortName, _ := strings.CutPrefix(tmpl.Name, ".GlobalVariables.")
+		result[shortName] = output.String()
+	}
+	return result, nil
+}
+
+type PreparedTableConfig struct {
+	ColumnTemplates         map[string][]*templates.Template
+	ColumnVariableTemplates map[string]*templates.Template
+	GlobalVariables         map[string]string
+	TableVariables          map[string]string
+	RowVariableTemplates    []*templates.Template
+}
+
+func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableConfig, error) {
+	result := make(map[string]*PreparedTableConfig)
+	renderedGlobalVariables, err := renderGlobalVariables(configData)
+	if err != nil {
+		return nil, fmt.Errorf("cannot render global variables: %w", err)
+	}
+	for _, tableConfig := range configData.TableConfigs {
+		preparedTableConfig, err := func() (*PreparedTableConfig, error) {
+			allTemplates := make(map[string]config.Template)
+			for name, tmpl := range configData.TableVariables {
+				allTemplates[".TableVariables."+name] = tmpl
+			}
+			for name, tmpl := range tableConfig.TableVariables {
+				allTemplates[".TableVariables."+name] = tmpl
+			}
+			for name, tmpl := range configData.RowVariables {
+				allTemplates[".RowVariables."+name] = tmpl
+			}
+			for name, tmpl := range tableConfig.RowVariables {
+				allTemplates[".RowVariables."+name] = tmpl
+			}
+			for name, tmpl := range configData.ColumnVariables {
+				allTemplates[".ColumnVariables."+name] = tmpl
+			}
+			for name, tmpl := range tableConfig.ColumnVariables {
+				allTemplates[".ColumnVariables."+name] = tmpl
+			}
+			var templatesForDependencyStack []string
+			columnTemplates := make(map[string][]*templates.Template)
+			for _, columnConfig := range tableConfig.Columns {
+				colName := columnConfig.ColumnName
+				templateCount := 0
+				for i, tmpl := range columnConfig.Templates {
+					columnTemplateName := "Column." + colName + "." + strconv.Itoa(i)
+					allTemplates[columnTemplateName] = tmpl
+					templatesForDependencyStack = append(templatesForDependencyStack, columnTemplateName)
+					templateCount++
+				}
+				columnTemplates[colName] = make([]*templates.Template, templateCount)
+			}
+			allCompiledTemplates, err := templates.CompileAllTemplates(allTemplates)
+			if err != nil {
+				return nil, fmt.Errorf("cannot compile all templates: %w", err)
+			}
+			dependencyStack, err := templates.GetDependencyStackForMultipleTemplates(templatesForDependencyStack, allCompiledTemplates)
+			if err != nil {
+				return nil, fmt.Errorf("cannot get dependency stack: %w", err)
+			}
+			var tableVariablesTemplates []*templates.Template
+			var rowVariableTemplates []*templates.Template
+			columnVariableTemplates := make(map[string]*templates.Template)
+			for _, tmpl := range dependencyStack {
+				switch {
+				case strings.HasPrefix(tmpl.Name, ".TableVariables."):
+					tableVariablesTemplates = append(tableVariablesTemplates, tmpl)
+				case strings.HasPrefix(tmpl.Name, ".RowVariables."):
+					rowVariableTemplates = append(rowVariableTemplates, tmpl)
+				case strings.HasPrefix(tmpl.Name, ".ColumnVariables."):
+					columnVariableTemplates[tmpl.Name] = tmpl
+				case strings.HasPrefix(tmpl.Name, "Column"):
+					splitted := strings.Split(tmpl.Name, ".")
+					colName := splitted[1]
+					colIndex, _ := strconv.Atoi(splitted[2])
+					columnTemplates[colName][colIndex] = tmpl
+				default:
+					return nil, fmt.Errorf("unable to resolve dependency type for: %s", tmpl.Name)
+				}
+			}
+			rendererTableVariables, err := renderTableVariables(tableVariablesTemplates, renderedGlobalVariables)
+			if err != nil {
+				return nil, fmt.Errorf("cannot render table variables: %w", err)
+			}
+			preparedTableConfig := &PreparedTableConfig{
+				GlobalVariables:         renderedGlobalVariables,
+				TableVariables:          rendererTableVariables,
+				RowVariableTemplates:    rowVariableTemplates,
+				ColumnVariableTemplates: columnVariableTemplates,
+				ColumnTemplates:         columnTemplates,
+			}
+			return preparedTableConfig, nil
+		}()
+		if err != nil {
+			return nil, fmt.Errorf("cannot prepare table config for '%s': %w", tableConfig.TableName, err)
+		}
+		result[tableConfig.TableName] = preparedTableConfig
+	}
+	return result, nil
+}
+
+func renderTableVariables(
+	tableVariableTemplates []*templates.Template,
+	globalVariables map[string]string,
+) (map[string]string, error) {
+	tableVariables := make(map[string]string, len(tableVariableTemplates))
+	for _, tmpl := range tableVariableTemplates {
+		output := new(bytes.Buffer)
+		err := tmpl.CompiledTemplate.Execute(output, struct {
+			GlobalVariables map[string]string
+			TableVariables  map[string]string
+		}{
+			GlobalVariables: globalVariables,
+			TableVariables:  tableVariables,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("cannot render table variables template '%w': %w", tmpl.Name, err)
+		}
+		shortName, _ := strings.CutPrefix(tmpl.Name, ".TableVariables.")
+		tableVariables[shortName] = output.String()
+	}
+	return tableVariables, nil
+}
+
+func renderGlobalVariables(configData config.Config) (map[string]string, error) {
+	compiledGlobalTemplates, err := templates.CompileTemplates(configData.GlobalVariables, "GlobalVariables")
+	if err != nil {
+		return nil, fmt.Errorf("cannot compile global variables templates: %w", err)
+	}
+	orderedGlobalTemplates, err := templates.GetOrderedTemplates(compiledGlobalTemplates)
+	if err != nil {
+		return nil, fmt.Errorf("cannot resolve global variables order: %w", err)
+	}
+	globalVariables := make(map[string]string, len(orderedGlobalTemplates))
+	for _, tmpl := range orderedGlobalTemplates {
+		output := new(bytes.Buffer)
+		err := tmpl.CompiledTemplate.Execute(output, struct {
+			GlobalVariables map[string]string
+		}{
+			GlobalVariables: globalVariables,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("cannot render global variables template '%w': %w", tmpl.Name, err)
+		}
+		shortName, _ := strings.CutPrefix(tmpl.Name, ".GlobalVariables.")
+		globalVariables[shortName] = output.String()
+	}
+
+	return globalVariables, nil
 }

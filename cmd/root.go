@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,8 +21,12 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"github.com/duffpl/go-mdp/config"
+	"github.com/duffpl/go-mdp/faker"
 	"github.com/duffpl/go-mdp/processor"
+	"github.com/duffpl/go-mdp/templates"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"io"
@@ -97,10 +101,24 @@ func initProcessor(cmd *cobra.Command) (*processor.Processor, error) {
 			return nil, fmt.Errorf("cannot read config file: %w", err)
 		}
 	}
-	p, err := processor.NewProcessorWithConfigJSON(configData)
+	configObject := &config.Config{}
+	err = json.Unmarshal(configData, configObject)
+	if err != nil {
+		return nil, fmt.Errorf("cannot unmarshal config json data: %w", err)
+	}
+	f := faker.Faker{
+		Locale: configObject.Settings.Locale,
+	}
+	templates.RegisterTemplateFuncs(f.FuncMap())
+	p, err := processor.NewProcessorWithConfig(*configObject)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create processor with config json data: %w", err)
 	}
+
+	if err != nil {
+		return nil, fmt.Errorf("cannot create processor with config json data: %w", err)
+	}
+	//transformations.RegisterColumnTransformations()
 	return p, nil
 }
 
@@ -136,10 +154,10 @@ func Execute() {
 }
 
 var (
-	FlagNameInput  = "input"
-	FlagNameOutput = "output"
-	FlagNameConfig = "config"
-	FlagNameConfigData = "config-data"
+	FlagNameInput          = "input"
+	FlagNameOutput         = "output"
+	FlagNameConfig         = "config"
+	FlagNameConfigData     = "config-data"
 	FlagNameConfigIsZipped = "config-zipped"
 )
 
@@ -155,7 +173,7 @@ func init() {
 	rootCmd.Flags().StringP(FlagNameOutput, "o", "", "output file (if not set stdout is used)")
 	rootCmd.Flags().StringP(FlagNameConfig, "c", "config.json", "config file")
 	rootCmd.Flags().StringP(FlagNameConfigData, "f", "", "encoded config file")
-	rootCmd.Flags().BoolP(FlagNameConfigIsZipped,"z", false, "is encoded config data zipped?")
+	rootCmd.Flags().BoolP(FlagNameConfigIsZipped, "z", false, "is encoded config data zipped?")
 
 	// Cobra also supports local flags, which will only run
 	// when this action is called directly.
