@@ -15,7 +15,7 @@ limitations under the License.
 */
 package main
 
-import "github.com/duffpl/go-mdp/cmd"
+import "github.com/duffpl/go-mdp/v2/cmd"
 
 func main() {
 	cmd.Execute()
