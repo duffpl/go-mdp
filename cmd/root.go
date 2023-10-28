@@ -118,7 +118,6 @@ func initProcessor(cmd *cobra.Command) (*processor.Processor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot create processor with config json data: %w", err)
 	}
-	//transformations.RegisterColumnTransformations()
 	return p, nil
 }
 

@@ -5,7 +5,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"github.com/bobg/go-generics/v2/slices"
+	"github.com/bobg/go-generics/v3/slices"
 	"github.com/duffpl/go-mdp/v2/config"
 	"github.com/duffpl/go-mdp/v2/templates"
 	"github.com/duffpl/go-mdp/v2/transformations"
@@ -46,7 +46,6 @@ func incrementTableCounter(tableName string) int {
 }
 
 func NewProcessor(config config.Config) (*Processor, error) {
-	//transformations.RegisterColumnTransformations()
 	tableTransformations, err := prepareTableConfigs(config)
 	if err != nil {
 		return nil, fmt.Errorf("unable to prepare transformations: %w", err)

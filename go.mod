@@ -1,9 +1,12 @@
 module github.com/duffpl/go-mdp/v2
 
-go 1.20
+go 1.21
+
+toolchain go1.21.3
 
 require (
 	github.com/Masterminds/sprig/v3 v3.2.2
+	github.com/bobg/go-generics/v3 v3.0.1
 	github.com/pingcap/parser v0.0.0-20200921041333-cd2542b7a8a2
 	github.com/pingcap/tidb v1.1.0-beta.0.20200921082409-501466fb690d
 	github.com/sirupsen/logrus v1.6.0
@@ -18,7 +21,6 @@ require (
 	github.com/Masterminds/semver/v3 v3.1.1 // indirect
 	github.com/StackExchange/wmi v0.0.0-20190523213315-cbe66965904d // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/bobg/go-generics/v2 v2.1.2 // indirect
 	github.com/cespare/xxhash/v2 v2.1.1 // indirect
 	github.com/cznic/mathutil v0.0.0-20181122101859-297441e03548 // indirect
 	github.com/danjacques/gofslock v0.0.0-20191023191349-0a45f885bc37 // indirect
