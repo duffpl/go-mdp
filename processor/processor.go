@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Processor struct {
@@ -380,13 +381,17 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 					if !ok {
 						return
 					}
+					then := time.Now()
 					processedLine, err := p.processLine(currentLine.line, stmtParser)
+					log.Printf("processing line took %s", time.Since(then))
+					then = time.Now()
 					if err != nil {
 						currentLine.outputChannel <- fmt.Sprintf("/* error: %s */\n%s", err.Error(), currentLine.line)
 						errCh <- err
 						return
 					}
 					currentLine.outputChannel <- processedLine
+					log.Printf("sending line took %s", time.Since(then))
 				}
 			}
 		}()
