@@ -355,6 +355,9 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 	linesForProcessing := make(chan lineWithOutputChannel, 100)
 	processorCount := runtime.NumCPU()
 	lineProcessorsWg := sync.WaitGroup{}
+	totalProcessingTime := time.Duration(0)
+	totalWaitTime := time.Duration(0)
+	linesProcessed := 0
 	go func() {
 		for line := range input {
 			processedCh := make(chan string)
@@ -383,7 +386,12 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 					}
 					then := time.Now()
 					processedLine, err := p.processLine(currentLine.line, stmtParser)
-					log.Printf("processing line took %s", time.Since(then))
+					took := time.Since(then)
+					totalProcessingTime += took
+					linesProcessed++
+					averageLineProcessingTime := totalProcessingTime / time.Duration(linesProcessed)
+					log.Printf("average line processing time: %s", averageLineProcessingTime)
+					//log.Printf("processing line took %s", time.Since(then))
 					then = time.Now()
 					if err != nil {
 						currentLine.outputChannel <- fmt.Sprintf("/* error: %s */\n%s", err.Error(), currentLine.line)
@@ -391,7 +399,10 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 						return
 					}
 					currentLine.outputChannel <- processedLine
-					log.Printf("sending line took %s", time.Since(then))
+					totalWaitTime += time.Since(then)
+					log.Printf("average wait time: %s", totalWaitTime/time.Duration(linesProcessed))
+
+					//log.Printf("sending line took %s", time.Since(then))
 				}
 			}
 		}()
