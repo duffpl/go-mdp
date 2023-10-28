@@ -380,8 +380,10 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 				return
 			case <-tick.C:
 				log.Printf("lines processed: %d", linesProcessed)
-				log.Printf("average processing time: %s", totalProcessingTime/time.Duration(linesProcessed))
-				log.Printf("average wait time: %s", totalWaitTime/time.Duration(linesProcessed))
+				if linesProcessed != 0 {
+					log.Printf("average processing time: %s", totalProcessingTime/time.Duration(linesProcessed))
+					log.Printf("average wait time: %s", totalWaitTime/time.Duration(linesProcessed))
+				}
 			}
 		}
 	}()
