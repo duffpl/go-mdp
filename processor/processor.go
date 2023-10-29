@@ -278,7 +278,7 @@ func readStatements(input io.Reader, ctx context.Context) (chan string, chan err
 	bufferedInput := bufio.NewReader(input)
 	errCh := make(chan error)
 	go func() {
-		currentStatementLine := ""
+		currentStatementLine := strings.Builder{}
 		defer func() {
 			close(outputCh)
 			close(errCh)
@@ -301,11 +301,16 @@ func readStatements(input io.Reader, ctx context.Context) (chan string, chan err
 				outputCh <- line
 				continue
 			}
-			currentStatementLine += line + "\n"
+			_, err = currentStatementLine.Write([]byte(line + "\n"))
+			if err != nil {
+				errCh <- err
+				return
+			}
+			//currentStatementLine += line + "\n"
 			lastCharacter := line[len(line)-1:]
 			if lastCharacter == ";" {
-				outputCh <- currentStatementLine
-				currentStatementLine = ""
+				outputCh <- currentStatementLine.String()
+				currentStatementLine = strings.Builder{}
 			} else {
 				continue
 			}
@@ -358,11 +363,11 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 	totalProcessingTime := time.Duration(0)
 	totalWaitTime := time.Duration(0)
 	linesProcessed := 0
-	lastRead := time.Now()
+	//lastRead := time.Now()
 	go func() {
 		for line := range input {
-			log.Printf("read line took %s", time.Since(lastRead))
-			lastRead = time.Now()
+			//log.Printf("read line took %s", time.Since(lastRead))
+			//lastRead = time.Now()
 			processedCh := make(chan string)
 			outputCh <- processedCh
 			linesForProcessing <- lineWithOutputChannel{
