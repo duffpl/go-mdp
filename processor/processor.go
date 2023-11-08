@@ -21,7 +21,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 )
 
 type Processor struct {
@@ -360,14 +359,8 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 	linesForProcessing := make(chan lineWithOutputChannel, 100)
 	processorCount := runtime.NumCPU()
 	lineProcessorsWg := sync.WaitGroup{}
-	totalProcessingTime := time.Duration(0)
-	totalWaitTime := time.Duration(0)
-	linesProcessed := 0
-	//lastRead := time.Now()
 	go func() {
 		for line := range input {
-			//log.Printf("read line took %s", time.Since(lastRead))
-			//lastRead = time.Now()
 			processedCh := make(chan string)
 			outputCh <- processedCh
 			linesForProcessing <- lineWithOutputChannel{
@@ -377,21 +370,7 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 		}
 		close(linesForProcessing)
 	}()
-	go func() {
-		tick := time.NewTicker(1 * time.Second)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-tick.C:
-				log.Printf("lines processed: %d", linesProcessed)
-				if linesProcessed != 0 {
-					log.Printf("average processing time: %s", totalProcessingTime/time.Duration(linesProcessed))
-					log.Printf("average wait time: %s", totalWaitTime/time.Duration(linesProcessed))
-				}
-			}
-		}
-	}()
+
 	for i := 0; i < processorCount; i++ {
 		go func() {
 			defer func() {
@@ -407,22 +386,13 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 					if !ok {
 						return
 					}
-					then := time.Now()
 					processedLine, err := p.processLine(currentLine.line, stmtParser)
-					took := time.Since(then)
-					totalProcessingTime += took
-					linesProcessed++
-					//log.Printf("processing line took %s", time.Since(then))
-					then = time.Now()
 					if err != nil {
 						currentLine.outputChannel <- fmt.Sprintf("/* error: %s */\n%s", err.Error(), currentLine.line)
 						errCh <- err
 						return
 					}
 					currentLine.outputChannel <- processedLine
-					totalWaitTime += time.Since(then)
-
-					//log.Printf("sending line took %s", time.Since(then))
 				}
 			}
 		}()
