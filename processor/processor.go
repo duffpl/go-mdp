@@ -412,13 +412,16 @@ func SetLogger(logger logrus.FieldLogger) {
 }
 
 func (p Processor) Process(input io.Reader, output io.Writer, pCtx context.Context) (err error) {
-	ctx, cancelCtx := context.WithCancel(pCtx)
-	readLines, inputErrors := readStatements(input, ctx)
-	processedLinesChans, processingErrors := p.processLines(readLines, ctx)
+	readLines, inputErrors := readStatements(input, pCtx)
+	processedLinesChans, processingErrors := p.processLines(readLines, pCtx)
+	done := make(chan error, 1)
 	go func() {
-		defer cancelCtx()
+		defer close(done)
 		for {
 			select {
+			case <-pCtx.Done():
+				done <- pCtx.Err()
+				return
 			case processedLineCh, ok := <-processedLinesChans:
 				if !ok {
 					return
@@ -426,27 +429,31 @@ func (p Processor) Process(input io.Reader, output io.Writer, pCtx context.Conte
 				processedLine := <-processedLineCh
 				_, err = output.Write([]byte(processedLine))
 				if err != nil {
-					err = fmt.Errorf("output error: %w", err)
+					done <- fmt.Errorf("output error: %w", err)
 					return
 				}
 			case err = <-inputErrors:
 				if err != nil {
-					err = fmt.Errorf("input error: %w", err)
+					done <- fmt.Errorf("input error: %w", err)
 					return
 				}
 			case err = <-processingErrors:
 				if err != nil {
-					err = fmt.Errorf("processing error: %w", err)
+					done <- fmt.Errorf("processing error: %w", err)
 					return
 				}
 			}
 		}
 	}()
-	<-ctx.Done()
-	if p.Config.PostSQL != "" {
-		_, err = output.Write([]byte(p.Config.PostSQL))
+	select {
+	case <-pCtx.Done():
+		return pCtx.Err()
+	case err = <-done:
+		if err == nil && p.Config.PostSQL != "" {
+			_, err = output.Write([]byte(p.Config.PostSQL))
+		}
+		return err
 	}
-	return err
 }
 
 func (p Processor) renderGlobalVariables() (map[string]string, error) {
