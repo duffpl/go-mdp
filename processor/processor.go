@@ -426,11 +426,17 @@ func (p Processor) Process(input io.Reader, output io.Writer, pCtx context.Conte
 				if !ok {
 					return
 				}
-				processedLine := <-processedLineCh
-				_, err = output.Write([]byte(processedLine))
-				if err != nil {
-					done <- fmt.Errorf("output error: %w", err)
+				processedLine, ok := <-processedLineCh
+				if !ok {
 					return
+				}
+
+				if output != nil && pCtx.Err() == nil {
+					_, err = output.Write([]byte(processedLine))
+					if err != nil {
+						done <- fmt.Errorf("output error: %w", err)
+						return
+					}
 				}
 			case err = <-inputErrors:
 				if err != nil {
