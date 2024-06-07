@@ -27,21 +27,22 @@ type Processor struct {
 	Config               config.Config
 	tableTransformations map[string]*PreparedTableConfig
 	globalVariables      map[string]string
+	tableRowCounterMutex *sync.Mutex
+	tableRowCounterMap   map[string]int
+	schemaMapLock        *sync.Mutex
+	tableSchemas         map[string]TableSchema
 }
-
-var tableRowCounterMutex = &sync.Mutex{}
-var tableRowCounterMap = make(map[string]int)
 
 func NewProcessorWithConfig(configData config.Config) (*Processor, error) {
 	return NewProcessor(configData)
 }
 
-func incrementTableCounter(tableName string) int {
-	tableRowCounterMutex.Lock()
-	defer tableRowCounterMutex.Unlock()
-	counter := tableRowCounterMap[tableName]
+func (p *Processor) incrementTableCounter(tableName string) int {
+	p.tableRowCounterMutex.Lock()
+	defer p.tableRowCounterMutex.Unlock()
+	counter := p.tableRowCounterMap[tableName]
 	counter++
-	tableRowCounterMap[tableName] = counter
+	p.tableRowCounterMap[tableName] = counter
 	return counter
 }
 
@@ -53,6 +54,10 @@ func NewProcessor(config config.Config) (*Processor, error) {
 	p := &Processor{
 		Config:               config,
 		tableTransformations: tableTransformations,
+		tableRowCounterMutex: &sync.Mutex{},
+		tableRowCounterMap:   make(map[string]int),
+		tableSchemas:         make(map[string]TableSchema),
+		schemaMapLock:        &sync.Mutex{},
 	}
 	globalVariables, err := p.renderGlobalVariables()
 	if err != nil {
@@ -62,10 +67,7 @@ func NewProcessor(config config.Config) (*Processor, error) {
 	return p, nil
 }
 
-var schemaMapLock = sync.Mutex{}
-var tableSchemas = make(map[string]TableSchema)
-
-func processCreateTableStatement(stmt *ast.CreateTableStmt) {
+func (p *Processor) processCreateTableStatement(stmt *ast.CreateTableStmt) {
 	tableName := stmt.Table.Name.String()
 	schema := TableSchema{
 		Columns: make(columnMap),
@@ -79,9 +81,9 @@ func processCreateTableStatement(stmt *ast.CreateTableStmt) {
 			Name:  col.Name.String(),
 		}
 	}
-	schemaMapLock.Lock()
-	tableSchemas[tableName] = schema
-	schemaMapLock.Unlock()
+	p.schemaMapLock.Lock()
+	p.tableSchemas[tableName] = schema
+	p.schemaMapLock.Unlock()
 }
 
 type rowTemplateData struct {
@@ -111,15 +113,15 @@ func mapInsertRowToColumns(insertRow []ast.ExprNode, tableSchema TableSchema) (t
 	return result, nil
 }
 
-func processInsertStatement(stmt *ast.InsertStmt, tableConfig *PreparedTableConfig) (string, error) {
+func (p *Processor) processInsertStatement(stmt *ast.InsertStmt, tableConfig *PreparedTableConfig) (string, error) {
 	tableName := stmt.Table.TableRefs.Left.(*ast.TableSource).Source.(*ast.TableName).Name.String()
-	schema, schemaFound := tableSchemas[tableName]
+	schema, schemaFound := p.tableSchemas[tableName]
 	if !schemaFound {
 		panic(tableName)
 	}
 	allInsertRows := stmt.Lists
 	for currentRowIndex := range allInsertRows {
-		tableRowIndex := incrementTableCounter(tableName)
+		tableRowIndex := p.incrementTableCounter(tableName)
 		currentRow := allInsertRows[currentRowIndex]
 		mappedRow, err := mapInsertRowToColumns(currentRow, schema)
 		if err != nil {
@@ -338,12 +340,12 @@ func (p Processor) processLine(line string, parser *parser.Parser) (string, erro
 	statement := parseResult[0]
 	switch statement.(type) {
 	case *ast.InsertStmt:
-		line, err = processInsertStatement(statement.(*ast.InsertStmt), tableTransformations)
+		line, err = p.processInsertStatement(statement.(*ast.InsertStmt), tableTransformations)
 		if err != nil {
 			return line, fmt.Errorf("cannot process insert statement for table %s: %w", tableName, err)
 		}
 	case *ast.CreateTableStmt:
-		processCreateTableStatement(statement.(*ast.CreateTableStmt))
+		p.processCreateTableStatement(statement.(*ast.CreateTableStmt))
 	}
 	return line, nil
 }
