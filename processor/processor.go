@@ -181,11 +181,11 @@ func (p *Processor) processInsertStatement(stmt *ast.InsertStmt, tableConfig *Pr
 		}
 	}
 	buf := new(bytes.Buffer)
-	err := stmt.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, buf))
+	err := stmt.Restore(format.NewRestoreCtx(restoreFlags, buf))
 	if err != nil {
 		return "", fmt.Errorf("cannot restore insert statement: %w", err)
 	}
-	return buf.String() + ";", nil
+	return buf.String() + ";\n", nil
 }
 
 func renderRowVariables(
@@ -408,6 +408,10 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 }
 
 var log logrus.FieldLogger = logrus.New()
+var restoreFlags = format.RestoreStringSingleQuotes |
+	format.RestoreKeyWordLowercase |
+	format.RestoreNameBackQuotes |
+	format.RestoreStringEscapeBackslash
 
 func SetLogger(logger logrus.FieldLogger) {
 	log = logger
