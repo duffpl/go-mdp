@@ -28,10 +28,18 @@ var seData []byte
 //go:embed no.json
 var noData []byte
 
+//go:embed dk.json
+var dkData []byte
+
+//go:embed default.json
+var defaultData []byte
+
 func init() {
 	loadData("fi", fiData)
 	loadData("se", seData)
 	loadData("no", noData)
+	loadData("dk", dkData)
+	loadData("default", defaultData)
 }
 
 var dataMap = make(map[string]fakerData)
@@ -43,6 +51,19 @@ func loadData(locale string, data []byte) {
 		panic(err)
 	}
 	dataMap[locale] = fd
+}
+
+func getDefaultLocale() string {
+	return "default"
+}
+
+func NewWithLocale(locale string) *Faker {
+	if _, ok := dataMap[locale]; !ok {
+		locale = getDefaultLocale()
+	}
+	return &Faker{
+		Locale: locale,
+	}
 }
 
 type Faker struct {

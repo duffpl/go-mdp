@@ -106,15 +106,9 @@ func initProcessor(cmd *cobra.Command) (*processor.Processor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot unmarshal config json data: %w", err)
 	}
-	f := faker.Faker{
-		Locale: configObject.Settings.Locale,
-	}
+	f := faker.NewWithLocale(configObject.Settings.Locale)
 	templates.RegisterTemplateFuncs(f.FuncMap())
 	p, err := processor.NewProcessorWithConfig(*configObject)
-	if err != nil {
-		return nil, fmt.Errorf("cannot create processor with config json data: %w", err)
-	}
-
 	if err != nil {
 		return nil, fmt.Errorf("cannot create processor with config json data: %w", err)
 	}
