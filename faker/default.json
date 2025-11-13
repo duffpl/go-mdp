@@ -394,5 +394,6 @@
     "Ltd",
     "Oy",
     "ApS"
-  ]
+  ],
+  "businessIdFormat": "000000000"
 }

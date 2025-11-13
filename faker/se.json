@@ -173,5 +173,6 @@
     "AB",
     "HB",
     "KB"
-  ]
+  ],
+  "businessIdFormat": "000000-0000"
 }

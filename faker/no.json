@@ -137,5 +137,6 @@
     "DA",
     "KS",
     "ENK"
-  ]
+  ],
+  "businessIdFormat": "000000000"
 }

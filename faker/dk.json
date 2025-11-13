@@ -378,5 +378,6 @@
     "I/S",
     "K/S",
     "Holding"
-  ]
+  ],
+  "businessIdFormat": "00000000"
 }

@@ -11,12 +11,13 @@ import (
 )
 
 type fakerData struct {
-	FirstNames      []string `json:"firstNames"`
-	LastNames       []string `json:"lastNames"`
-	StreetNames     []string `json:"streetNames"`
-	Cities          []string `json:"cityNames"`
-	Companies       []string `json:"companies"`
-	CompanySuffixes []string `json:"companySuffixes"`
+	FirstNames       []string `json:"firstNames"`
+	LastNames        []string `json:"lastNames"`
+	StreetNames      []string `json:"streetNames"`
+	Cities           []string `json:"cityNames"`
+	Companies        []string `json:"companies"`
+	CompanySuffixes  []string `json:"companySuffixes"`
+	BusinessIdFormat string   `json:"businessIdFormat"`
 }
 
 //go:embed fi.json
@@ -90,6 +91,9 @@ func (f *Faker) FuncMap() template.FuncMap {
 		"transformFullName": func(input string) string {
 			return TransformFullName(input, f.Locale)
 		},
+		"transformBusinessId": func(input string) string {
+			return TransformBusinessId(input, f.Locale)
+		},
 	}
 }
 
@@ -154,6 +158,26 @@ func TransformCompanyName(input string, locale string) string {
 		companyNameParts = append(companyNameParts, dataMap[locale].CompanySuffixes[rng.Intn(len(dataMap[locale].CompanySuffixes))])
 	}
 	return strings.Join(companyNameParts, " ")
+}
+
+func TransformBusinessId(input string, locale string) string {
+	if input == "" {
+		return ""
+	}
+	rng := initRng(input)
+
+	format := dataMap[locale].BusinessIdFormat
+
+	var result strings.Builder
+	for _, char := range format {
+		if char == '0' {
+			result.WriteString(strconv.Itoa(rng.Intn(10)))
+		} else {
+			result.WriteRune(char)
+		}
+	}
+
+	return result.String()
 }
 
 func initRng(input string) *rand.Rand {
