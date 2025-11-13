@@ -5,6 +5,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"regexp"
+	//"runtime"
+	"strconv"
+	"strings"
+	"sync"
+
 	"github.com/bobg/go-generics/v3/slices"
 	"github.com/duffpl/go-mdp/v2/config"
 	"github.com/duffpl/go-mdp/v2/templates"
@@ -15,12 +22,6 @@ import (
 	"github.com/pingcap/parser/mysql"
 	_ "github.com/pingcap/tidb/types/parser_driver"
 	"github.com/sirupsen/logrus"
-	"io"
-	"regexp"
-	"runtime"
-	"strconv"
-	"strings"
-	"sync"
 )
 
 type Processor struct {
@@ -329,6 +330,7 @@ func (p Processor) processLine(line string, parser *parser.Parser) (string, erro
 	case preparsedStatementWithTable:
 		tableName = preparseResult.(preparsedStatementWithTable).GetTableName()
 	}
+	fmt.Printf("processing line for table %s\n", tableName)
 	tableTransformations, ok := p.tableTransformations[tableName]
 	if !ok {
 		return line, nil
@@ -357,20 +359,40 @@ type lineWithOutputChannel struct {
 
 func (p Processor) processLines(input chan string, ctx context.Context) (chan chan string, chan error) {
 	outputCh := make(chan chan string, 100)
-	errCh := make(chan error)
+	errCh := make(chan error, 1) // buffered to ensure error is never dropped
 	linesForProcessing := make(chan lineWithOutputChannel, 100)
-	processorCount := runtime.NumCPU()
+	processorCount := 1
 	lineProcessorsWg := sync.WaitGroup{}
+
+	// Create a cancellable context for coordinated shutdown
+	processingCtx, cancelProcessing := context.WithCancel(ctx)
+
 	go func() {
+		defer close(linesForProcessing)
 		for line := range input {
-			processedCh := make(chan string)
-			outputCh <- processedCh
-			linesForProcessing <- lineWithOutputChannel{
+			select {
+			case <-processingCtx.Done():
+				// Stop creating new work if processing is cancelled
+				return
+			default:
+			}
+			processedCh := make(chan string, 1) // buffered to prevent blocking
+			select {
+			case outputCh <- processedCh:
+			case <-processingCtx.Done():
+				close(processedCh)
+				return
+			}
+			select {
+			case linesForProcessing <- lineWithOutputChannel{
 				line:          line,
 				outputChannel: processedCh,
+			}:
+			case <-processingCtx.Done():
+				close(processedCh)
+				return
 			}
 		}
-		close(linesForProcessing)
 	}()
 
 	for i := 0; i < processorCount; i++ {
@@ -382,7 +404,11 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 			stmtParser := parser.New()
 			for {
 				select {
-				case <-ctx.Done():
+				case <-processingCtx.Done():
+					// Drain remaining work and close orphaned channels
+					for work := range linesForProcessing {
+						close(work.outputChannel)
+					}
 					return
 				case currentLine, ok := <-linesForProcessing:
 					if !ok {
@@ -391,6 +417,14 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 					processedLine, err := p.processLine(currentLine.line, stmtParser)
 					if err != nil {
 						currentLine.outputChannel <- fmt.Sprintf("/* error: %s */\n%s", err.Error(), currentLine.line)
+						// Cancel processing context to stop all goroutines
+						cancelProcessing()
+						// Drain remaining work and close orphaned channels FIRST
+						// This allows the main loop to finish reading from those channels
+						for work := range linesForProcessing {
+							close(work.outputChannel)
+						}
+						// Now send the error - main loop can receive it
 						errCh <- err
 						return
 					}
@@ -401,6 +435,7 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 	}
 	go func() {
 		lineProcessorsWg.Wait()
+		cancelProcessing() // Ensure context is cancelled when workers finish
 		close(outputCh)
 		close(errCh)
 	}()
@@ -434,7 +469,8 @@ func (p Processor) Process(input io.Reader, output io.Writer, pCtx context.Conte
 				}
 				processedLine, ok := <-processedLineCh
 				if !ok {
-					return
+					// Channel was closed (orphaned work), continue to check for errors
+					continue
 				}
 
 				if output != nil && pCtx.Err() == nil {
