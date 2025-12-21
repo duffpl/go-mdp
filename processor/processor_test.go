@@ -1,0 +1,743 @@
+package processor
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/duffpl/go-mdp/v2/config"
+)
+
+// loadFixture loads a SQL fixture file from testdata/fixtures
+func loadFixture(t testing.TB, name string) string {
+	t.Helper()
+	path := filepath.Join("testdata", "fixtures", name)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("Failed to load fixture %s: %v", name, err)
+	}
+	return string(data)
+}
+
+// loadBenchmarkData loads a SQL benchmark file from testdata/benchmark
+func loadBenchmarkData(b *testing.B, name string) string {
+	b.Helper()
+	path := filepath.Join("testdata", "benchmark", name)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		b.Fatalf("Failed to load benchmark data %s: %v", name, err)
+	}
+	return string(data)
+}
+
+// processSQL is a helper that creates a processor and processes the input SQL
+func processSQL(t *testing.T, cfg config.Config, input string) (string, error) {
+	t.Helper()
+
+	processor, err := NewProcessor(cfg)
+	if err != nil {
+		return "", err
+	}
+
+	inputReader := strings.NewReader(input)
+	outputBuffer := &bytes.Buffer{}
+	ctx := context.Background()
+
+	err = processor.Process(inputReader, outputBuffer, ctx)
+	if err != nil {
+		return "", err
+	}
+
+	return outputBuffer.String(), nil
+}
+
+func TestProcessor_AnonymizeEmail(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "users",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "email",
+						Templates:  []config.Template{"user-{{ .Row.id }}@anonymized.test"},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "users.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if !strings.Contains(output, "user-1@anonymized.test") {
+		t.Errorf("Expected anonymized email 'user-1@anonymized.test' in output, got:\n%s", output)
+	}
+
+	if strings.Contains(output, "john.doe@example.com") {
+		t.Errorf("Original email should not be present in output")
+	}
+}
+
+func TestProcessor_AnonymizeMultipleColumns(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "users",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "email",
+						Templates:  []config.Template{"anon-{{ .Row.id }}@test.com"},
+					},
+					{
+						ColumnName: "first_name",
+						Templates:  []config.Template{"FirstName{{ .Row.id }}"},
+					},
+					{
+						ColumnName: "last_name",
+						Templates:  []config.Template{"LastName{{ .Row.id }}"},
+					},
+					{
+						ColumnName: "password",
+						Templates:  []config.Template{"hashed_password"},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "users.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	checks := []struct {
+		expected    string
+		notExpected string
+		desc        string
+	}{
+		{"anon-1@test.com", "john.doe@example.com", "email"},
+		{"FirstName1", "John", "first_name"},
+		{"LastName1", "Doe", "last_name"},
+		{"hashed_password", "secret123", "password"},
+	}
+
+	for _, c := range checks {
+		if !strings.Contains(output, c.expected) {
+			t.Errorf("Expected anonymized %s '%s' in output", c.desc, c.expected)
+		}
+		if strings.Contains(output, c.notExpected) {
+			t.Errorf("Original %s '%s' should not be present in output", c.desc, c.notExpected)
+		}
+	}
+}
+
+func TestProcessor_MD5Template(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "users",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "email",
+						Templates:  []config.Template{"{{ md5 .FieldValue }}@hashed.test"},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "users.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if !strings.Contains(output, "@hashed.test") {
+		t.Errorf("Expected MD5 hashed email in output, got:\n%s", output)
+	}
+
+	if strings.Contains(output, "john.doe@example.com") {
+		t.Errorf("Original email should not be present in output")
+	}
+}
+
+func TestProcessor_PreserveNonConfiguredColumns(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "users",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "email",
+						Templates:  []config.Template{"anonymized@test.com"},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "users.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if !strings.Contains(output, "'John'") {
+		t.Errorf("Non-configured column 'first_name' should be preserved, got:\n%s", output)
+	}
+}
+
+func TestProcessor_NonConfiguredTablePassthrough(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "users",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "email",
+						Templates:  []config.Template{"anonymized@test.com"},
+					},
+				},
+			},
+		},
+	}
+
+	usersSQL := loadFixture(t, "users.sql")
+	ordersSQL := loadFixture(t, "orders.sql")
+	input := usersSQL + ordersSQL
+
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if !strings.Contains(output, "99.99") {
+		t.Errorf("Non-configured table 'orders' should pass through unchanged")
+	}
+	if !strings.Contains(output, "'completed'") {
+		t.Errorf("Non-configured table 'orders' should pass through unchanged")
+	}
+}
+
+func TestProcessor_MultipleRows(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "members",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "name",
+						Templates:  []config.Template{"Member{{ .RowMeta.Index }}"},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "members.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if !strings.Contains(output, "Member1") {
+		t.Errorf("Expected 'Member1' in output")
+	}
+	if !strings.Contains(output, "Member2") {
+		t.Errorf("Expected 'Member2' in output")
+	}
+	if !strings.Contains(output, "Member3") {
+		t.Errorf("Expected 'Member3' in output")
+	}
+}
+
+func TestProcessor_RowVariables(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "contacts",
+				RowVariables: map[string]config.Template{
+					"anon_id": "anon_{{ .Row.id }}",
+				},
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "full_name",
+						Templates:  []config.Template{"{{ .RowVariables.anon_id }}_name"},
+					},
+					{
+						ColumnName: "email",
+						Templates:  []config.Template{"{{ .RowVariables.anon_id }}@anonymized.test"},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "contacts.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if !strings.Contains(output, "anon_42_name") {
+		t.Errorf("Expected row variable to be used in full_name, got:\n%s", output)
+	}
+	if !strings.Contains(output, "anon_42@anonymized.test") {
+		t.Errorf("Expected row variable to be used in email, got:\n%s", output)
+	}
+}
+
+func TestProcessor_DeterministicOutput(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "users",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "email",
+						Templates:  []config.Template{"{{ md5 .FieldValue }}@test.com"},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "users.sql")
+
+	output1, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("First process failed: %v", err)
+	}
+
+	output2, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Second process failed: %v", err)
+	}
+
+	if !strings.Contains(output1, "@test.com") {
+		t.Errorf("First output should contain hashed email, got:\n%s", output1)
+	}
+
+	if !strings.Contains(output2, "@test.com") {
+		t.Errorf("Second output should contain hashed email, got:\n%s", output2)
+	}
+
+	if output1 != output2 {
+		t.Errorf("Processor output should be deterministic.\nFirst:\n%s\nSecond:\n%s", output1, output2)
+	}
+}
+
+func TestProcessor_SpecialCharacters(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "texts",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "content",
+						Templates:  []config.Template{"Anonymized content {{ .Row.id }}"},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "texts.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL with special characters: %v", err)
+	}
+
+	if !strings.Contains(output, "Anonymized content 1") {
+		t.Errorf("Expected anonymized content in output, got:\n%s", output)
+	}
+}
+
+func TestProcessor_EmptyValue(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "profiles",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "bio",
+						Templates:  []config.Template{"anon_bio_{{ .Row.id }}"},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "profiles.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL with empty value: %v", err)
+	}
+
+	if !strings.Contains(output, "anon_bio_1") {
+		t.Errorf("Expected anonymized bio in output, got:\n%s", output)
+	}
+}
+
+func TestProcessor_PostSQL(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "users",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "email",
+						Templates:  []config.Template{"anon@test.com"},
+					},
+				},
+			},
+		},
+		PostSQL: "\n-- Anonymization complete\nSELECT 'done';\n",
+	}
+
+	input := loadFixture(t, "users.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if !strings.HasSuffix(output, "SELECT 'done';\n") {
+		t.Errorf("Expected PostSQL at end of output, got:\n%s", output)
+	}
+}
+
+func TestProcessor_GlobalVariables(t *testing.T) {
+	cfg := config.Config{
+		GlobalVariables: map[string]config.Template{
+			"domain": "anonymized-domain.test",
+		},
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "users",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "email",
+						Templates:  []config.Template{"user{{ .Row.id }}@{{ .GlobalVariables.domain }}"},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "users.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if !strings.Contains(output, "user1@anonymized-domain.test") {
+		t.Errorf("Expected global variable to be used in email, got:\n%s", output)
+	}
+}
+
+func TestProcessor_TableVariables(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "users",
+				TableVariables: map[string]config.Template{
+					"table_prefix": "users_anon",
+				},
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "email",
+						Templates:  []config.Template{"{{ .TableVariables.table_prefix }}_{{ .Row.id }}@test.com"},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "users.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if !strings.Contains(output, "users_anon_1@test.com") {
+		t.Errorf("Expected table variable to be used in email, got:\n%s", output)
+	}
+}
+
+func TestProcessor_MultiValueInsert(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "items",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "name",
+						Templates:  []config.Template{"Anon Item {{ .RowMeta.Index }}"},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "items.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if !strings.Contains(output, "Anon Item 1") {
+		t.Errorf("Expected 'Anon Item 1' in output")
+	}
+	if !strings.Contains(output, "Anon Item 2") {
+		t.Errorf("Expected 'Anon Item 2' in output")
+	}
+	if !strings.Contains(output, "Anon Item 3") {
+		t.Errorf("Expected 'Anon Item 3' in output")
+	}
+
+	if strings.Contains(output, "Item One") {
+		t.Errorf("Original 'Item One' should not be present")
+	}
+}
+
+func TestProcessor_SprigFunctions(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "users",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "email",
+						Templates:  []config.Template{"{{ lower .FieldValue | trunc 10 }}@sprig.test"},
+					},
+					{
+						ColumnName: "first_name",
+						Templates:  []config.Template{"{{ upper .FieldValue }}"},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "users.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if !strings.Contains(output, "@sprig.test") {
+		t.Errorf("Expected Sprig truncated email in output, got:\n%s", output)
+	}
+
+	if !strings.Contains(output, "'JOHN'") {
+		t.Errorf("Expected Sprig uppercased first_name in output, got:\n%s", output)
+	}
+}
+
+// Benchmark configuration for anonymizing benchmark_users table
+func benchmarkConfig() config.Config {
+	return config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "benchmark_users",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "email",
+						Templates:  []config.Template{"user-{{ .Row.id }}@anonymized.test"},
+					},
+					{
+						ColumnName: "first_name",
+						Templates:  []config.Template{"{{ md5 .FieldValue }}"},
+					},
+					{
+						ColumnName: "last_name",
+						Templates:  []config.Template{"{{ md5 .FieldValue }}"},
+					},
+					{
+						ColumnName: "phone",
+						Templates:  []config.Template{"+1-555-{{ .RowMeta.Index }}"},
+					},
+					{
+						ColumnName: "address",
+						Templates:  []config.Template{"{{ .RowMeta.Index }} Anonymous Street"},
+					},
+					{
+						ColumnName: "company",
+						Templates:  []config.Template{"Company {{ .Row.id }}"},
+					},
+					{
+						ColumnName: "notes",
+						Templates:  []config.Template{"Anonymized notes for user {{ .Row.id }}"},
+					},
+				},
+			},
+		},
+	}
+}
+
+func BenchmarkProcessor_Small_100rows(b *testing.B) {
+	cfg := benchmarkConfig()
+	input := loadBenchmarkData(b, "small.sql")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		processor, err := NewProcessor(cfg)
+		if err != nil {
+			b.Fatalf("Failed to create processor: %v", err)
+		}
+		inputReader := strings.NewReader(input)
+		outputBuffer := &bytes.Buffer{}
+		ctx := context.Background()
+		_ = processor.Process(inputReader, outputBuffer, ctx)
+	}
+}
+
+func BenchmarkProcessor_Medium_1000rows(b *testing.B) {
+	cfg := benchmarkConfig()
+	input := loadBenchmarkData(b, "medium.sql")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		processor, err := NewProcessor(cfg)
+		if err != nil {
+			b.Fatalf("Failed to create processor: %v", err)
+		}
+		inputReader := strings.NewReader(input)
+		outputBuffer := &bytes.Buffer{}
+		ctx := context.Background()
+		_ = processor.Process(inputReader, outputBuffer, ctx)
+	}
+}
+
+func BenchmarkProcessor_Large_10000rows(b *testing.B) {
+	cfg := benchmarkConfig()
+	input := loadBenchmarkData(b, "large.sql")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		processor, err := NewProcessor(cfg)
+		if err != nil {
+			b.Fatalf("Failed to create processor: %v", err)
+		}
+		inputReader := strings.NewReader(input)
+		outputBuffer := &bytes.Buffer{}
+		ctx := context.Background()
+		_ = processor.Process(inputReader, outputBuffer, ctx)
+	}
+}
+
+func BenchmarkProcessor_XLarge_100000rows(b *testing.B) {
+	cfg := benchmarkConfig()
+	input := loadBenchmarkData(b, "xlarge.sql")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		processor, err := NewProcessor(cfg)
+		if err != nil {
+			b.Fatalf("Failed to create processor: %v", err)
+		}
+		inputReader := strings.NewReader(input)
+		outputBuffer := &bytes.Buffer{}
+		ctx := context.Background()
+		_ = processor.Process(inputReader, outputBuffer, ctx)
+	}
+}
+
+func BenchmarkProcessor_XXLarge_500000rows(b *testing.B) {
+	cfg := benchmarkConfig()
+	input := loadBenchmarkData(b, "xxlarge.sql")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		processor, err := NewProcessor(cfg)
+		if err != nil {
+			b.Fatalf("Failed to create processor: %v", err)
+		}
+		inputReader := strings.NewReader(input)
+		outputBuffer := &bytes.Buffer{}
+		ctx := context.Background()
+		_ = processor.Process(inputReader, outputBuffer, ctx)
+	}
+}
+
+func BenchmarkProcessor_Huge_2000000rows(b *testing.B) {
+	cfg := benchmarkConfig()
+	input := loadBenchmarkData(b, "huge.sql")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		processor, err := NewProcessor(cfg)
+		if err != nil {
+			b.Fatalf("Failed to create processor: %v", err)
+		}
+		inputReader := strings.NewReader(input)
+		outputBuffer := &bytes.Buffer{}
+		ctx := context.Background()
+		_ = processor.Process(inputReader, outputBuffer, ctx)
+	}
+}
+
+func BenchmarkProcessor_MD5_Only(b *testing.B) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "benchmark_users",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "email",
+						Templates:  []config.Template{"{{ md5 .FieldValue }}@hashed.test"},
+					},
+				},
+			},
+		},
+	}
+	input := loadBenchmarkData(b, "medium.sql")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		processor, err := NewProcessor(cfg)
+		if err != nil {
+			b.Fatalf("Failed to create processor: %v", err)
+		}
+		inputReader := strings.NewReader(input)
+		outputBuffer := &bytes.Buffer{}
+		ctx := context.Background()
+		_ = processor.Process(inputReader, outputBuffer, ctx)
+	}
+}
+
+func BenchmarkProcessor_SimpleTemplate(b *testing.B) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "benchmark_users",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "email",
+						Templates:  []config.Template{"user{{ .Row.id }}@test.com"},
+					},
+				},
+			},
+		},
+	}
+	input := loadBenchmarkData(b, "medium.sql")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		processor, err := NewProcessor(cfg)
+		if err != nil {
+			b.Fatalf("Failed to create processor: %v", err)
+		}
+		inputReader := strings.NewReader(input)
+		outputBuffer := &bytes.Buffer{}
+		ctx := context.Background()
+		_ = processor.Process(inputReader, outputBuffer, ctx)
+	}
+}
