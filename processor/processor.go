@@ -330,7 +330,6 @@ func (p Processor) processLine(line string, parser *parser.Parser) (string, erro
 	case preparsedStatementWithTable:
 		tableName = preparseResult.(preparsedStatementWithTable).GetTableName()
 	}
-	fmt.Printf("processing line for table %s\n", tableName)
 	tableTransformations, ok := p.tableTransformations[tableName]
 	if !ok {
 		return line, nil
