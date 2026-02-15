@@ -2,7 +2,7 @@ package processor
 
 import (
 	"errors"
-	"github.com/pingcap/parser/types"
+	"github.com/pingcap/tidb/pkg/parser/types"
 )
 
 type ColumnSchema struct {

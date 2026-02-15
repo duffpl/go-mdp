@@ -15,11 +15,11 @@ import (
 	"github.com/duffpl/go-mdp/v2/config"
 	"github.com/duffpl/go-mdp/v2/templates"
 	"github.com/duffpl/go-mdp/v2/transformations"
-	"github.com/pingcap/parser"
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/format"
-	"github.com/pingcap/parser/mysql"
-	_ "github.com/pingcap/tidb/types/parser_driver"
+	"github.com/pingcap/tidb/pkg/parser"
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/parser/format"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
+	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
 	"github.com/sirupsen/logrus"
 )
 
@@ -129,13 +129,14 @@ func mapInsertRowToColumns(insertRow []ast.ExprNode, tableSchema TableSchema) (t
 	return result, nil
 }
 
-func (p *Processor) processInsertStatement(stmt *ast.InsertStmt, tableConfig *PreparedTableConfig) (string, error) {
+func (p *Processor) processInsertStatement(stmt *ast.InsertStmt, tableConfig *PreparedTableConfig, startRowIndex int) (string, error) {
 	tableName := stmt.Table.TableRefs.Left.(*ast.TableSource).Source.(*ast.TableName).Name.String()
 	// Wait for schema to be available (CREATE TABLE must be processed first)
 	schema := p.waitForSchema(tableName)
 	allInsertRows := stmt.Lists
 	for currentRowIndex := range allInsertRows {
-		tableRowIndex := p.incrementTableCounter(tableName)
+		// Use pre-computed row index (no lock needed)
+		tableRowIndex := startRowIndex + currentRowIndex
 		currentRow := allInsertRows[currentRowIndex]
 		mappedRow, err := mapInsertRowToColumns(currentRow, schema)
 		if err != nil {
@@ -334,7 +335,7 @@ func readStatements(input io.Reader, ctx context.Context) (chan string, chan err
 	return outputCh, errCh
 }
 
-func (p Processor) processLine(line string, parser *parser.Parser) (string, error) {
+func (p Processor) processLine(line string, parser *parser.Parser, startRowIndex int) (string, error) {
 	var tableName string
 	preparseResult := preparse(line)
 	switch preparseResult.(type) {
@@ -354,7 +355,7 @@ func (p Processor) processLine(line string, parser *parser.Parser) (string, erro
 	statement := parseResult[0]
 	switch statement.(type) {
 	case *ast.InsertStmt:
-		line, err = p.processInsertStatement(statement.(*ast.InsertStmt), tableTransformations)
+		line, err = p.processInsertStatement(statement.(*ast.InsertStmt), tableTransformations, startRowIndex)
 		if err != nil {
 			return line, fmt.Errorf("cannot process insert statement for table %s: %w", tableName, err)
 		}
@@ -367,6 +368,17 @@ func (p Processor) processLine(line string, parser *parser.Parser) (string, erro
 type lineWithOutputChannel struct {
 	line          string
 	outputChannel chan string
+	startRowIndex int    // pre-computed starting row index for this statement
+	tableName     string // table name for INSERT statements
+}
+
+// countInsertRows quickly counts the number of value tuples in an INSERT statement
+// by counting occurrences of "),(" plus 1 for the first tuple
+var rowCountRegex = regexp.MustCompile(`\),\s*\(`)
+
+func countInsertRows(line string) int {
+	matches := rowCountRegex.FindAllStringIndex(line, -1)
+	return len(matches) + 1 // +1 for the first tuple
 }
 
 func (p Processor) processLines(input chan string, ctx context.Context) (chan chan string, chan error) {
@@ -379,6 +391,9 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 	// Create a cancellable context for coordinated shutdown
 	processingCtx, cancelProcessing := context.WithCancel(ctx)
 
+	// Row counters per table - only accessed by dispatcher goroutine (no lock needed)
+	tableRowCounters := make(map[string]int)
+
 	go func() {
 		defer close(linesForProcessing)
 		for line := range input {
@@ -388,6 +403,18 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 				return
 			default:
 			}
+
+			// Pre-compute row index for INSERT statements
+			var startRowIndex int
+			var tableName string
+			preparsed := preparse(line)
+			if insertStmt, ok := preparsed.(preparsedInsertStmt); ok {
+				tableName = insertStmt.GetTableName()
+				rowCount := countInsertRows(line)
+				startRowIndex = tableRowCounters[tableName] + 1 // 1-based indexing
+				tableRowCounters[tableName] += rowCount
+			}
+
 			processedCh := make(chan string, 1) // buffered to prevent blocking
 			select {
 			case outputCh <- processedCh:
@@ -399,6 +426,8 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 			case linesForProcessing <- lineWithOutputChannel{
 				line:          line,
 				outputChannel: processedCh,
+				startRowIndex: startRowIndex,
+				tableName:     tableName,
 			}:
 			case <-processingCtx.Done():
 				close(processedCh)
@@ -426,7 +455,7 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 					if !ok {
 						return
 					}
-					processedLine, err := p.processLine(currentLine.line, stmtParser)
+					processedLine, err := p.processLine(currentLine.line, stmtParser, currentLine.startRowIndex)
 					if err != nil {
 						currentLine.outputChannel <- fmt.Sprintf("/* error: %s */\n%s", err.Error(), currentLine.line)
 						// Cancel processing context to stop all goroutines

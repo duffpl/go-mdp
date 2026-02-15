@@ -3,3 +3,9 @@ build
 *.sql
 go-mdp
 config*
+handoffs/
+.worktree/
+*.prof
+*.test
+trace.out
+trace_*.prof
