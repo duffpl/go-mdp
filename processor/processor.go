@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"regexp"
-	//"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,6 +31,7 @@ type Processor struct {
 	tableRowCounterMap   map[string]int
 	schemaMapLock        *sync.Mutex
 	tableSchemas         map[string]TableSchema
+	schemaReadyCond      *sync.Cond // condition variable to wait for schema
 }
 
 func NewProcessorWithConfig(configData config.Config) (*Processor, error) {
@@ -52,13 +52,15 @@ func NewProcessor(config config.Config) (*Processor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to prepare transformations: %w", err)
 	}
+	schemaLock := &sync.Mutex{}
 	p := &Processor{
 		Config:               config,
 		tableTransformations: tableTransformations,
 		tableRowCounterMutex: &sync.Mutex{},
 		tableRowCounterMap:   make(map[string]int),
 		tableSchemas:         make(map[string]TableSchema),
-		schemaMapLock:        &sync.Mutex{},
+		schemaMapLock:        schemaLock,
+		schemaReadyCond:      sync.NewCond(schemaLock),
 	}
 	globalVariables, err := p.renderGlobalVariables()
 	if err != nil {
@@ -84,7 +86,20 @@ func (p *Processor) processCreateTableStatement(stmt *ast.CreateTableStmt) {
 	}
 	p.schemaMapLock.Lock()
 	p.tableSchemas[tableName] = schema
+	p.schemaReadyCond.Broadcast() // wake up any goroutines waiting for this schema
 	p.schemaMapLock.Unlock()
+}
+
+// waitForSchema blocks until the schema for tableName is available
+func (p *Processor) waitForSchema(tableName string) TableSchema {
+	p.schemaMapLock.Lock()
+	defer p.schemaMapLock.Unlock()
+	for {
+		if schema, ok := p.tableSchemas[tableName]; ok {
+			return schema
+		}
+		p.schemaReadyCond.Wait() // releases lock, waits for signal, re-acquires lock
+	}
 }
 
 type rowTemplateData struct {
@@ -116,10 +131,8 @@ func mapInsertRowToColumns(insertRow []ast.ExprNode, tableSchema TableSchema) (t
 
 func (p *Processor) processInsertStatement(stmt *ast.InsertStmt, tableConfig *PreparedTableConfig) (string, error) {
 	tableName := stmt.Table.TableRefs.Left.(*ast.TableSource).Source.(*ast.TableName).Name.String()
-	schema, schemaFound := p.tableSchemas[tableName]
-	if !schemaFound {
-		panic(tableName)
-	}
+	// Wait for schema to be available (CREATE TABLE must be processed first)
+	schema := p.waitForSchema(tableName)
 	allInsertRows := stmt.Lists
 	for currentRowIndex := range allInsertRows {
 		tableRowIndex := p.incrementTableCounter(tableName)
@@ -326,13 +339,13 @@ func (p Processor) processLine(line string, parser *parser.Parser) (string, erro
 	preparseResult := preparse(line)
 	switch preparseResult.(type) {
 	case nil:
-		return line, nil
+		return line, nil // passthrough: not a CREATE/INSERT
 	case preparsedStatementWithTable:
 		tableName = preparseResult.(preparsedStatementWithTable).GetTableName()
 	}
 	tableTransformations, ok := p.tableTransformations[tableName]
 	if !ok {
-		return line, nil
+		return line, nil // passthrough: table not configured
 	}
 	parseResult, _, err := parser.Parse(line, mysql.UTF8Charset, mysql.UTF8Charset)
 	if err != nil {
@@ -360,7 +373,7 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 	outputCh := make(chan chan string, 100)
 	errCh := make(chan error, 1) // buffered to ensure error is never dropped
 	linesForProcessing := make(chan lineWithOutputChannel, 100)
-	processorCount := 1
+	processorCount := 8
 	lineProcessorsWg := sync.WaitGroup{}
 
 	// Create a cancellable context for coordinated shutdown
@@ -521,7 +534,7 @@ func (p Processor) renderGlobalVariables() (map[string]string, error) {
 			GlobalVariables: result,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("cannot render global variables template '%w': %w", tmpl.Name, err)
+			return nil, fmt.Errorf("cannot render global variables template '%s': %w", tmpl.Name, err)
 		}
 		shortName, _ := strings.CutPrefix(tmpl.Name, ".GlobalVariables.")
 		result[shortName] = output.String()
@@ -641,7 +654,7 @@ func renderTableVariables(
 			TableVariables:  tableVariables,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("cannot render table variables template '%w': %w", tmpl.Name, err)
+			return nil, fmt.Errorf("cannot render table variables template '%s': %w", tmpl.Name, err)
 		}
 		shortName, _ := strings.CutPrefix(tmpl.Name, ".TableVariables.")
 		tableVariables[shortName] = output.String()
@@ -667,7 +680,7 @@ func renderGlobalVariables(configData config.Config) (map[string]string, error) 
 			GlobalVariables: globalVariables,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("cannot render global variables template '%w': %w", tmpl.Name, err)
+			return nil, fmt.Errorf("cannot render global variables template '%s': %w", tmpl.Name, err)
 		}
 		shortName, _ := strings.CutPrefix(tmpl.Name, ".GlobalVariables.")
 		globalVariables[shortName] = output.String()
