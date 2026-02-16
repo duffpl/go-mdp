@@ -5,6 +5,7 @@ go-mdp
 config*
 handoffs/
 .worktree/
+.worktrees/
 *.prof
 *.test
 trace.out
