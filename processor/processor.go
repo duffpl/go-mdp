@@ -163,13 +163,54 @@ func (p *Processor) processInsertStatement(stmt *ast.InsertStmt, tableConfig *Pr
 
 		for columnIdx := range currentRow {
 			columnSchema, _ := schema.Columns[columnIdx]
+
+			// Check if we have ColumnOps (new path)
+			if columnOps, ok := tableConfig.ColumnOps[columnSchema.Name]; ok {
+				for _, op := range columnOps {
+					switch op.Type {
+					case "template":
+						currentColumn := currentRow[columnIdx]
+						columnVariablesTemplates := slices.Filter(op.CompiledTemplate.Dependencies, func(tmpl *templates.Template) bool {
+							return strings.HasPrefix(tmpl.Name, ".ColumnVariables")
+						})
+						columnData := &columnTemplateData{
+							rowTemplateData: *rowData,
+							FieldValue:      currentColumn.(ast.ValueExpr).GetString(),
+							ColumnVariables: make(map[string]string),
+						}
+						err = renderColumnVariables(columnVariablesTemplates, columnData)
+						if err != nil {
+							return "", fmt.Errorf("cannot render column variables: %w", err)
+						}
+						transformedValue := new(bytes.Buffer)
+						err := op.CompiledTemplate.CompiledTemplate.Execute(transformedValue, columnData)
+						if err != nil {
+							return "", fmt.Errorf("cannot apply transform: %w", err)
+						}
+						currentRow[columnIdx] = ast.NewValueExpr(transformedValue.String(), mysql.UTF8Charset, mysql.UTF8Charset)
+					case "json":
+						currentValue := currentRow[columnIdx].(ast.ValueExpr).GetString()
+						columnData := &columnTemplateData{
+							rowTemplateData: *rowData,
+							FieldValue:      currentValue,
+							ColumnVariables: make(map[string]string),
+						}
+						transformedJSON, err := applyJsonTransform(currentValue, op.JsonFields, columnData)
+						if err != nil {
+							return "", fmt.Errorf("JSON transform failed for column '%s': %w", columnSchema.Name, err)
+						}
+						currentRow[columnIdx] = ast.NewValueExpr(transformedJSON, mysql.UTF8Charset, mysql.UTF8Charset)
+					}
+				}
+				continue
+			}
+
+			// Legacy path: use ColumnTemplates
 			currentColumn := currentRow[columnIdx]
 			columnTemplates, ok := tableConfig.ColumnTemplates[columnSchema.Name]
-
 			if !ok {
 				continue
 			}
-			// render column templates
 			for _, tmpl := range columnTemplates {
 				if err != nil {
 					return "", fmt.Errorf("cannot get transformation function: %w", err)
@@ -571,7 +612,14 @@ func (p Processor) renderGlobalVariables() (map[string]string, error) {
 	return result, nil
 }
 
+type PreparedColumnOp struct {
+	Type             string             // "template" or "json"
+	CompiledTemplate *templates.Template // for type "template"
+	JsonFields       []jsonFieldOp      // for type "json"
+}
+
 type PreparedTableConfig struct {
+	ColumnOps               map[string][]PreparedColumnOp
 	ColumnTemplates         map[string][]*templates.Template
 	ColumnVariableTemplates map[string]*templates.Template
 	GlobalVariables         map[string]string
@@ -608,16 +656,57 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 			}
 			var templatesForDependencyStack []string
 			columnTemplates := make(map[string][]*templates.Template)
+			columnOps := make(map[string][]PreparedColumnOp)
+			// Track which template indices map to which operation for later assembly
+			type templateOpMapping struct {
+				colName  string
+				opIndex  int
+				tmplIdx  int
+			}
+			var templateOpMappings []templateOpMapping
 			for _, columnConfig := range tableConfig.Columns {
 				colName := columnConfig.ColumnName
-				templateCount := 0
-				for i, tmpl := range columnConfig.Templates {
-					columnTemplateName := "Column." + colName + "." + strconv.Itoa(i)
-					allTemplates[columnTemplateName] = tmpl
-					templatesForDependencyStack = append(templatesForDependencyStack, columnTemplateName)
-					templateCount++
+				if len(columnConfig.Operations) > 0 {
+					// New path: build ops from Operations
+					ops := make([]PreparedColumnOp, len(columnConfig.Operations))
+					templateCount := 0
+					for opIdx, op := range columnConfig.Operations {
+						switch op.Type {
+						case "template":
+							tmplName := "Column." + colName + "." + strconv.Itoa(templateCount)
+							allTemplates[tmplName] = op.Template
+							templatesForDependencyStack = append(templatesForDependencyStack, tmplName)
+							templateOpMappings = append(templateOpMappings, templateOpMapping{colName, opIdx, templateCount})
+							templateCount++
+							ops[opIdx] = PreparedColumnOp{Type: "template"}
+						case "json":
+							jsonFields := make([]jsonFieldOp, len(op.JsonFields))
+							for j, f := range op.JsonFields {
+								compiled, err := templates.GetCompiledTemplate(string(f.Template), fmt.Sprintf("json.%s.%s", colName, f.Path))
+								if err != nil {
+									return nil, fmt.Errorf("cannot compile JSON field template for path '%s': %w", f.Path, err)
+								}
+								jsonFields[j] = jsonFieldOp{
+									path:     f.Path,
+									template: compiled,
+								}
+							}
+							ops[opIdx] = PreparedColumnOp{Type: "json", JsonFields: jsonFields}
+						}
+					}
+					columnOps[colName] = ops
+					columnTemplates[colName] = make([]*templates.Template, templateCount)
+				} else {
+					// Legacy path: build from Templates
+					templateCount := 0
+					for i, tmpl := range columnConfig.Templates {
+						columnTemplateName := "Column." + colName + "." + strconv.Itoa(i)
+						allTemplates[columnTemplateName] = tmpl
+						templatesForDependencyStack = append(templatesForDependencyStack, columnTemplateName)
+						templateCount++
+					}
+					columnTemplates[colName] = make([]*templates.Template, templateCount)
 				}
-				columnTemplates[colName] = make([]*templates.Template, templateCount)
 			}
 			allCompiledTemplates, err := templates.CompileAllTemplates(allTemplates)
 			if err != nil {
@@ -647,6 +736,13 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 					return nil, fmt.Errorf("unable to resolve dependency type for: %s", tmpl.Name)
 				}
 			}
+			// Wire up compiled templates into ColumnOps for "template" operations
+			for _, mapping := range templateOpMappings {
+				compiledTmpl := columnTemplates[mapping.colName][mapping.tmplIdx]
+				if ops, ok := columnOps[mapping.colName]; ok {
+					ops[mapping.opIndex].CompiledTemplate = compiledTmpl
+				}
+			}
 			rendererTableVariables, err := renderTableVariables(tableVariablesTemplates, renderedGlobalVariables)
 			if err != nil {
 				return nil, fmt.Errorf("cannot render table variables: %w", err)
@@ -657,6 +753,7 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 				RowVariableTemplates:    rowVariableTemplates,
 				ColumnVariableTemplates: columnVariableTemplates,
 				ColumnTemplates:         columnTemplates,
+				ColumnOps:               columnOps,
 			}
 			return preparedTableConfig, nil
 		}()

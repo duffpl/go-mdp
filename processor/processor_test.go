@@ -541,6 +541,160 @@ func TestProcessor_SprigFunctions(t *testing.T) {
 	}
 }
 
+func TestProcessor_JsonTransform_SimpleField(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "events",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "metadata",
+						Operations: []config.ColumnOperation{
+							{
+								Type: "json",
+								JsonFields: []config.JsonFieldConfig{
+									{Path: "user.firstName", Template: "REDACTED"},
+									{Path: "user.lastName", Template: "REDACTED"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "events.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if strings.Contains(output, "John") {
+		t.Errorf("Original firstName 'John' should not be present in output, got:\n%s", output)
+	}
+	if strings.Contains(output, "Doe") {
+		t.Errorf("Original lastName 'Doe' should not be present in output, got:\n%s", output)
+	}
+	if !strings.Contains(output, "REDACTED") {
+		t.Errorf("Expected 'REDACTED' in output, got:\n%s", output)
+	}
+}
+
+func TestProcessor_JsonTransform_ArrayWildcard(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "events",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "metadata",
+						Operations: []config.ColumnOperation{
+							{
+								Type: "json",
+								JsonFields: []config.JsonFieldConfig{
+									{Path: "tags.#.value", Template: "anon-tag"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "events_with_arrays.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if !strings.Contains(output, "anon-tag") {
+		t.Errorf("Expected 'anon-tag' in output, got:\n%s", output)
+	}
+}
+
+func TestProcessor_JsonTransform_WithFieldValue(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "events",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "metadata",
+						Operations: []config.ColumnOperation{
+							{
+								Type: "json",
+								JsonFields: []config.JsonFieldConfig{
+									{Path: "user.email", Template: "{{ md5 .FieldValue }}@anon.test"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "events.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if strings.Contains(output, "john@real.com") {
+		t.Errorf("Original email should not be present in output")
+	}
+	if !strings.Contains(output, "@anon.test") {
+		t.Errorf("Expected anonymized email in output, got:\n%s", output)
+	}
+}
+
+func TestProcessor_JsonTransform_MixedWithTemplate(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "events",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "metadata",
+						Operations: []config.ColumnOperation{
+							{
+								Type: "json",
+								JsonFields: []config.JsonFieldConfig{
+									{Path: "user.firstName", Template: "ANON"},
+								},
+							},
+						},
+					},
+					{
+						ColumnName: "event_type",
+						Operations: []config.ColumnOperation{
+							{
+								Type:     "template",
+								Template: "anonymized_event",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "events.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if !strings.Contains(output, "ANON") {
+		t.Errorf("Expected JSON field anonymized in output")
+	}
+	if !strings.Contains(output, "anonymized_event") {
+		t.Errorf("Expected template-transformed event_type in output")
+	}
+}
+
 // Benchmark configuration for anonymizing benchmark_users table
 func benchmarkConfig() config.Config {
 	return config.Config{
