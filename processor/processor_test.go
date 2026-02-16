@@ -3,6 +3,7 @@ package processor
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -692,6 +693,47 @@ func TestProcessor_JsonTransform_MixedWithTemplate(t *testing.T) {
 	}
 	if !strings.Contains(output, "anonymized_event") {
 		t.Errorf("Expected template-transformed event_type in output")
+	}
+}
+
+func TestProcessor_JsonTransform_FromJSONConfig(t *testing.T) {
+	configJSON := `{
+		"tables": [{
+			"name": "events",
+			"columns": [{
+				"name": "metadata",
+				"transformations": [{
+					"type": "json",
+					"options": {
+						"fields": [
+							{"path": "user.firstName", "template": "ANON_FIRST"},
+							{"path": "user.lastName", "template": "ANON_LAST"}
+						]
+					}
+				}]
+			}]
+		}]
+	}`
+
+	var cfg config.Config
+	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
+		t.Fatalf("Failed to parse config: %v", err)
+	}
+
+	input := loadFixture(t, "events.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if strings.Contains(output, "John") {
+		t.Errorf("Original firstName should be anonymized, got:\n%s", output)
+	}
+	if !strings.Contains(output, "ANON_FIRST") {
+		t.Errorf("Expected 'ANON_FIRST' in output, got:\n%s", output)
+	}
+	if !strings.Contains(output, "ANON_LAST") {
+		t.Errorf("Expected 'ANON_LAST' in output, got:\n%s", output)
 	}
 }
 
