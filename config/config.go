@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 )
 
 type Config struct {
@@ -28,8 +29,20 @@ type TableConfig struct {
 	TableVariables  map[string]Template `json:"tableVariables,omitempty"`
 }
 
+type ColumnOperation struct {
+	Type       string            // "template" or "json"
+	Template   Template          // used when Type == "template"
+	JsonFields []JsonFieldConfig // used when Type == "json"
+}
+
+type JsonFieldConfig struct {
+	Path     string   `json:"path"`
+	Template Template `json:"template"`
+}
+
 type ColumnConfig struct {
 	ColumnName string
+	Operations []ColumnOperation
 	Templates  []Template
 }
 
@@ -38,24 +51,62 @@ type ColumnTransformation interface {
 }
 
 func (c *ColumnConfig) UnmarshalJSON(bytes []byte) error {
-
-	type tmpTransformation struct {
+	type jsonFieldRaw struct {
+		Path     string `json:"path"`
 		Template string `json:"template"`
 	}
-	type tmpConfig struct {
-		Name            string              `json:"name"`
-		Transformations []tmpTransformation `json:"transformations"`
+	type optionsRaw struct {
+		Template string         `json:"template"`
+		Fields   []jsonFieldRaw `json:"fields"`
 	}
-	parsedTmpConfig := tmpConfig{}
-	err := json.Unmarshal(bytes, &parsedTmpConfig)
-	if err != nil {
+	type transformationRaw struct {
+		Type    string     `json:"type"`
+		Options optionsRaw `json:"options"`
+	}
+	type columnRaw struct {
+		Name            string             `json:"name"`
+		Transformations []transformationRaw `json:"transformations"`
+	}
+
+	var raw columnRaw
+	if err := json.Unmarshal(bytes, &raw); err != nil {
 		return err
 	}
-	c.ColumnName = parsedTmpConfig.Name
-	c.Templates = make([]Template, len(parsedTmpConfig.Transformations))
-	for i := range parsedTmpConfig.Transformations {
-		c.Templates[i] = Template(parsedTmpConfig.Transformations[i].Template)
+
+	c.ColumnName = raw.Name
+	c.Operations = make([]ColumnOperation, len(raw.Transformations))
+	c.Templates = nil
+
+	for i, t := range raw.Transformations {
+		opType := t.Type
+		if opType == "" {
+			opType = "template"
+		}
+
+		switch opType {
+		case "template":
+			c.Operations[i] = ColumnOperation{
+				Type:     "template",
+				Template: Template(t.Options.Template),
+			}
+			c.Templates = append(c.Templates, Template(t.Options.Template))
+		case "json":
+			fields := make([]JsonFieldConfig, len(t.Options.Fields))
+			for j, f := range t.Options.Fields {
+				fields[j] = JsonFieldConfig{
+					Path:     f.Path,
+					Template: Template(f.Template),
+				}
+			}
+			c.Operations[i] = ColumnOperation{
+				Type:       "json",
+				JsonFields: fields,
+			}
+		default:
+			return fmt.Errorf("unknown transformation type: %s", opType)
+		}
 	}
+
 	return nil
 }
 

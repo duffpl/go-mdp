@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"regexp"
-	//"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,11 +15,11 @@ import (
 	"github.com/duffpl/go-mdp/v2/config"
 	"github.com/duffpl/go-mdp/v2/templates"
 	"github.com/duffpl/go-mdp/v2/transformations"
-	"github.com/pingcap/parser"
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/format"
-	"github.com/pingcap/parser/mysql"
-	_ "github.com/pingcap/tidb/types/parser_driver"
+	"github.com/pingcap/tidb/pkg/parser"
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/parser/format"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
+	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
 	"github.com/sirupsen/logrus"
 )
 
@@ -32,6 +31,7 @@ type Processor struct {
 	tableRowCounterMap   map[string]int
 	schemaMapLock        *sync.Mutex
 	tableSchemas         map[string]TableSchema
+	schemaReadyCond      *sync.Cond // condition variable to wait for schema
 }
 
 func NewProcessorWithConfig(configData config.Config) (*Processor, error) {
@@ -52,13 +52,15 @@ func NewProcessor(config config.Config) (*Processor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to prepare transformations: %w", err)
 	}
+	schemaLock := &sync.Mutex{}
 	p := &Processor{
 		Config:               config,
 		tableTransformations: tableTransformations,
 		tableRowCounterMutex: &sync.Mutex{},
 		tableRowCounterMap:   make(map[string]int),
 		tableSchemas:         make(map[string]TableSchema),
-		schemaMapLock:        &sync.Mutex{},
+		schemaMapLock:        schemaLock,
+		schemaReadyCond:      sync.NewCond(schemaLock),
 	}
 	globalVariables, err := p.renderGlobalVariables()
 	if err != nil {
@@ -84,7 +86,20 @@ func (p *Processor) processCreateTableStatement(stmt *ast.CreateTableStmt) {
 	}
 	p.schemaMapLock.Lock()
 	p.tableSchemas[tableName] = schema
+	p.schemaReadyCond.Broadcast() // wake up any goroutines waiting for this schema
 	p.schemaMapLock.Unlock()
+}
+
+// waitForSchema blocks until the schema for tableName is available
+func (p *Processor) waitForSchema(tableName string) TableSchema {
+	p.schemaMapLock.Lock()
+	defer p.schemaMapLock.Unlock()
+	for {
+		if schema, ok := p.tableSchemas[tableName]; ok {
+			return schema
+		}
+		p.schemaReadyCond.Wait() // releases lock, waits for signal, re-acquires lock
+	}
 }
 
 type rowTemplateData struct {
@@ -114,15 +129,14 @@ func mapInsertRowToColumns(insertRow []ast.ExprNode, tableSchema TableSchema) (t
 	return result, nil
 }
 
-func (p *Processor) processInsertStatement(stmt *ast.InsertStmt, tableConfig *PreparedTableConfig) (string, error) {
+func (p *Processor) processInsertStatement(stmt *ast.InsertStmt, tableConfig *PreparedTableConfig, startRowIndex int) (string, error) {
 	tableName := stmt.Table.TableRefs.Left.(*ast.TableSource).Source.(*ast.TableName).Name.String()
-	schema, schemaFound := p.tableSchemas[tableName]
-	if !schemaFound {
-		panic(tableName)
-	}
+	// Wait for schema to be available (CREATE TABLE must be processed first)
+	schema := p.waitForSchema(tableName)
 	allInsertRows := stmt.Lists
 	for currentRowIndex := range allInsertRows {
-		tableRowIndex := p.incrementTableCounter(tableName)
+		// Use pre-computed row index (no lock needed)
+		tableRowIndex := startRowIndex + currentRowIndex
 		currentRow := allInsertRows[currentRowIndex]
 		mappedRow, err := mapInsertRowToColumns(currentRow, schema)
 		if err != nil {
@@ -149,13 +163,54 @@ func (p *Processor) processInsertStatement(stmt *ast.InsertStmt, tableConfig *Pr
 
 		for columnIdx := range currentRow {
 			columnSchema, _ := schema.Columns[columnIdx]
+
+			// Check if we have ColumnOps (new path)
+			if columnOps, ok := tableConfig.ColumnOps[columnSchema.Name]; ok {
+				for _, op := range columnOps {
+					switch op.Type {
+					case "template":
+						currentColumn := currentRow[columnIdx]
+						columnVariablesTemplates := slices.Filter(op.CompiledTemplate.Dependencies, func(tmpl *templates.Template) bool {
+							return strings.HasPrefix(tmpl.Name, ".ColumnVariables")
+						})
+						columnData := &columnTemplateData{
+							rowTemplateData: *rowData,
+							FieldValue:      currentColumn.(ast.ValueExpr).GetString(),
+							ColumnVariables: make(map[string]string),
+						}
+						err = renderColumnVariables(columnVariablesTemplates, columnData)
+						if err != nil {
+							return "", fmt.Errorf("cannot render column variables: %w", err)
+						}
+						transformedValue := new(bytes.Buffer)
+						err := op.CompiledTemplate.CompiledTemplate.Execute(transformedValue, columnData)
+						if err != nil {
+							return "", fmt.Errorf("cannot apply transform: %w", err)
+						}
+						currentRow[columnIdx] = ast.NewValueExpr(transformedValue.String(), mysql.UTF8Charset, mysql.UTF8Charset)
+					case "json":
+						currentValue := currentRow[columnIdx].(ast.ValueExpr).GetString()
+						columnData := &columnTemplateData{
+							rowTemplateData: *rowData,
+							FieldValue:      currentValue,
+							ColumnVariables: make(map[string]string),
+						}
+						transformedJSON, err := applyJsonTransform(currentValue, op.JsonFields, columnData)
+						if err != nil {
+							return "", fmt.Errorf("JSON transform failed for column '%s': %w", columnSchema.Name, err)
+						}
+						currentRow[columnIdx] = ast.NewValueExpr(transformedJSON, mysql.UTF8Charset, mysql.UTF8Charset)
+					}
+				}
+				continue
+			}
+
+			// Legacy path: use ColumnTemplates
 			currentColumn := currentRow[columnIdx]
 			columnTemplates, ok := tableConfig.ColumnTemplates[columnSchema.Name]
-
 			if !ok {
 				continue
 			}
-			// render column templates
 			for _, tmpl := range columnTemplates {
 				if err != nil {
 					return "", fmt.Errorf("cannot get transformation function: %w", err)
@@ -321,19 +376,18 @@ func readStatements(input io.Reader, ctx context.Context) (chan string, chan err
 	return outputCh, errCh
 }
 
-func (p Processor) processLine(line string, parser *parser.Parser) (string, error) {
+func (p Processor) processLine(line string, parser *parser.Parser, startRowIndex int) (string, error) {
 	var tableName string
 	preparseResult := preparse(line)
 	switch preparseResult.(type) {
 	case nil:
-		return line, nil
+		return line, nil // passthrough: not a CREATE/INSERT
 	case preparsedStatementWithTable:
 		tableName = preparseResult.(preparsedStatementWithTable).GetTableName()
 	}
-	fmt.Printf("processing line for table %s\n", tableName)
 	tableTransformations, ok := p.tableTransformations[tableName]
 	if !ok {
-		return line, nil
+		return line, nil // passthrough: table not configured
 	}
 	parseResult, _, err := parser.Parse(line, mysql.UTF8Charset, mysql.UTF8Charset)
 	if err != nil {
@@ -342,7 +396,7 @@ func (p Processor) processLine(line string, parser *parser.Parser) (string, erro
 	statement := parseResult[0]
 	switch statement.(type) {
 	case *ast.InsertStmt:
-		line, err = p.processInsertStatement(statement.(*ast.InsertStmt), tableTransformations)
+		line, err = p.processInsertStatement(statement.(*ast.InsertStmt), tableTransformations, startRowIndex)
 		if err != nil {
 			return line, fmt.Errorf("cannot process insert statement for table %s: %w", tableName, err)
 		}
@@ -355,17 +409,31 @@ func (p Processor) processLine(line string, parser *parser.Parser) (string, erro
 type lineWithOutputChannel struct {
 	line          string
 	outputChannel chan string
+	startRowIndex int    // pre-computed starting row index for this statement
+	tableName     string // table name for INSERT statements
+}
+
+// countInsertRows quickly counts the number of value tuples in an INSERT statement
+// by counting occurrences of "),(" plus 1 for the first tuple
+var rowCountRegex = regexp.MustCompile(`\),\s*\(`)
+
+func countInsertRows(line string) int {
+	matches := rowCountRegex.FindAllStringIndex(line, -1)
+	return len(matches) + 1 // +1 for the first tuple
 }
 
 func (p Processor) processLines(input chan string, ctx context.Context) (chan chan string, chan error) {
 	outputCh := make(chan chan string, 100)
 	errCh := make(chan error, 1) // buffered to ensure error is never dropped
 	linesForProcessing := make(chan lineWithOutputChannel, 100)
-	processorCount := 1
+	processorCount := 8
 	lineProcessorsWg := sync.WaitGroup{}
 
 	// Create a cancellable context for coordinated shutdown
 	processingCtx, cancelProcessing := context.WithCancel(ctx)
+
+	// Row counters per table - only accessed by dispatcher goroutine (no lock needed)
+	tableRowCounters := make(map[string]int)
 
 	go func() {
 		defer close(linesForProcessing)
@@ -376,6 +444,18 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 				return
 			default:
 			}
+
+			// Pre-compute row index for INSERT statements
+			var startRowIndex int
+			var tableName string
+			preparsed := preparse(line)
+			if insertStmt, ok := preparsed.(preparsedInsertStmt); ok {
+				tableName = insertStmt.GetTableName()
+				rowCount := countInsertRows(line)
+				startRowIndex = tableRowCounters[tableName] + 1 // 1-based indexing
+				tableRowCounters[tableName] += rowCount
+			}
+
 			processedCh := make(chan string, 1) // buffered to prevent blocking
 			select {
 			case outputCh <- processedCh:
@@ -387,6 +467,8 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 			case linesForProcessing <- lineWithOutputChannel{
 				line:          line,
 				outputChannel: processedCh,
+				startRowIndex: startRowIndex,
+				tableName:     tableName,
 			}:
 			case <-processingCtx.Done():
 				close(processedCh)
@@ -414,7 +496,7 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 					if !ok {
 						return
 					}
-					processedLine, err := p.processLine(currentLine.line, stmtParser)
+					processedLine, err := p.processLine(currentLine.line, stmtParser, currentLine.startRowIndex)
 					if err != nil {
 						currentLine.outputChannel <- fmt.Sprintf("/* error: %s */\n%s", err.Error(), currentLine.line)
 						// Cancel processing context to stop all goroutines
@@ -522,7 +604,7 @@ func (p Processor) renderGlobalVariables() (map[string]string, error) {
 			GlobalVariables: result,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("cannot render global variables template '%w': %w", tmpl.Name, err)
+			return nil, fmt.Errorf("cannot render global variables template '%s': %w", tmpl.Name, err)
 		}
 		shortName, _ := strings.CutPrefix(tmpl.Name, ".GlobalVariables.")
 		result[shortName] = output.String()
@@ -530,7 +612,14 @@ func (p Processor) renderGlobalVariables() (map[string]string, error) {
 	return result, nil
 }
 
+type PreparedColumnOp struct {
+	Type             string             // "template" or "json"
+	CompiledTemplate *templates.Template // for type "template"
+	JsonFields       []jsonFieldOp      // for type "json"
+}
+
 type PreparedTableConfig struct {
+	ColumnOps               map[string][]PreparedColumnOp
 	ColumnTemplates         map[string][]*templates.Template
 	ColumnVariableTemplates map[string]*templates.Template
 	GlobalVariables         map[string]string
@@ -567,16 +656,57 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 			}
 			var templatesForDependencyStack []string
 			columnTemplates := make(map[string][]*templates.Template)
+			columnOps := make(map[string][]PreparedColumnOp)
+			// Track which template indices map to which operation for later assembly
+			type templateOpMapping struct {
+				colName  string
+				opIndex  int
+				tmplIdx  int
+			}
+			var templateOpMappings []templateOpMapping
 			for _, columnConfig := range tableConfig.Columns {
 				colName := columnConfig.ColumnName
-				templateCount := 0
-				for i, tmpl := range columnConfig.Templates {
-					columnTemplateName := "Column." + colName + "." + strconv.Itoa(i)
-					allTemplates[columnTemplateName] = tmpl
-					templatesForDependencyStack = append(templatesForDependencyStack, columnTemplateName)
-					templateCount++
+				if len(columnConfig.Operations) > 0 {
+					// New path: build ops from Operations
+					ops := make([]PreparedColumnOp, len(columnConfig.Operations))
+					templateCount := 0
+					for opIdx, op := range columnConfig.Operations {
+						switch op.Type {
+						case "template":
+							tmplName := "Column." + colName + "." + strconv.Itoa(templateCount)
+							allTemplates[tmplName] = op.Template
+							templatesForDependencyStack = append(templatesForDependencyStack, tmplName)
+							templateOpMappings = append(templateOpMappings, templateOpMapping{colName, opIdx, templateCount})
+							templateCount++
+							ops[opIdx] = PreparedColumnOp{Type: "template"}
+						case "json":
+							jsonFields := make([]jsonFieldOp, len(op.JsonFields))
+							for j, f := range op.JsonFields {
+								compiled, err := templates.GetCompiledTemplate(string(f.Template), fmt.Sprintf("json.%s.%s", colName, f.Path))
+								if err != nil {
+									return nil, fmt.Errorf("cannot compile JSON field template for path '%s': %w", f.Path, err)
+								}
+								jsonFields[j] = jsonFieldOp{
+									path:     f.Path,
+									template: compiled,
+								}
+							}
+							ops[opIdx] = PreparedColumnOp{Type: "json", JsonFields: jsonFields}
+						}
+					}
+					columnOps[colName] = ops
+					columnTemplates[colName] = make([]*templates.Template, templateCount)
+				} else {
+					// Legacy path: build from Templates
+					templateCount := 0
+					for i, tmpl := range columnConfig.Templates {
+						columnTemplateName := "Column." + colName + "." + strconv.Itoa(i)
+						allTemplates[columnTemplateName] = tmpl
+						templatesForDependencyStack = append(templatesForDependencyStack, columnTemplateName)
+						templateCount++
+					}
+					columnTemplates[colName] = make([]*templates.Template, templateCount)
 				}
-				columnTemplates[colName] = make([]*templates.Template, templateCount)
 			}
 			allCompiledTemplates, err := templates.CompileAllTemplates(allTemplates)
 			if err != nil {
@@ -606,6 +736,13 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 					return nil, fmt.Errorf("unable to resolve dependency type for: %s", tmpl.Name)
 				}
 			}
+			// Wire up compiled templates into ColumnOps for "template" operations
+			for _, mapping := range templateOpMappings {
+				compiledTmpl := columnTemplates[mapping.colName][mapping.tmplIdx]
+				if ops, ok := columnOps[mapping.colName]; ok {
+					ops[mapping.opIndex].CompiledTemplate = compiledTmpl
+				}
+			}
 			rendererTableVariables, err := renderTableVariables(tableVariablesTemplates, renderedGlobalVariables)
 			if err != nil {
 				return nil, fmt.Errorf("cannot render table variables: %w", err)
@@ -616,6 +753,7 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 				RowVariableTemplates:    rowVariableTemplates,
 				ColumnVariableTemplates: columnVariableTemplates,
 				ColumnTemplates:         columnTemplates,
+				ColumnOps:               columnOps,
 			}
 			return preparedTableConfig, nil
 		}()
@@ -642,7 +780,7 @@ func renderTableVariables(
 			TableVariables:  tableVariables,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("cannot render table variables template '%w': %w", tmpl.Name, err)
+			return nil, fmt.Errorf("cannot render table variables template '%s': %w", tmpl.Name, err)
 		}
 		shortName, _ := strings.CutPrefix(tmpl.Name, ".TableVariables.")
 		tableVariables[shortName] = output.String()
@@ -668,7 +806,7 @@ func renderGlobalVariables(configData config.Config) (map[string]string, error) 
 			GlobalVariables: globalVariables,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("cannot render global variables template '%w': %w", tmpl.Name, err)
+			return nil, fmt.Errorf("cannot render global variables template '%s': %w", tmpl.Name, err)
 		}
 		shortName, _ := strings.CutPrefix(tmpl.Name, ".GlobalVariables.")
 		globalVariables[shortName] = output.String()

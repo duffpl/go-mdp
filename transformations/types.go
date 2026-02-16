@@ -2,7 +2,7 @@ package transformations
 
 import (
 	"encoding/json"
-	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 )
 
 type ColumnTransformationInitializer func(rawOptions json.RawMessage, extraOptions any) (ColumnTransformationFunction, error)
