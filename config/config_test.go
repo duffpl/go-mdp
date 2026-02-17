@@ -114,3 +114,47 @@ func TestColumnConfig_UnmarshalJSON_DefaultType(t *testing.T) {
 		t.Errorf("Expected default type 'template', got '%s'", col.Operations[0].Type)
 	}
 }
+
+func TestTableConfig_UnmarshalJSON_SkipField(t *testing.T) {
+	input := `{
+		"tables": [
+			{"name": "audit_log", "skip": true},
+			{"name": "users", "columns": []}
+		]
+	}`
+	var cfg Config
+	if err := json.Unmarshal([]byte(input), &cfg); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	if len(cfg.TableConfigs) != 2 {
+		t.Fatalf("Expected 2 table configs, got %d", len(cfg.TableConfigs))
+	}
+	if !cfg.TableConfigs[0].Skip {
+		t.Error("Expected audit_log to have Skip=true")
+	}
+	if cfg.TableConfigs[0].TableName != "audit_log" {
+		t.Errorf("Expected table name 'audit_log', got '%s'", cfg.TableConfigs[0].TableName)
+	}
+	if cfg.TableConfigs[1].Skip {
+		t.Error("Expected users to have Skip=false")
+	}
+}
+
+func TestConfig_SkipTablesField(t *testing.T) {
+	input := `{
+		"skipTables": ["cache_entries", "job_queue"]
+	}`
+	var cfg Config
+	if err := json.Unmarshal([]byte(input), &cfg); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	if len(cfg.SkipTables) != 2 {
+		t.Fatalf("Expected 2 skip tables, got %d", len(cfg.SkipTables))
+	}
+	if cfg.SkipTables[0] != "cache_entries" {
+		t.Errorf("Expected 'cache_entries', got '%s'", cfg.SkipTables[0])
+	}
+	if cfg.SkipTables[1] != "job_queue" {
+		t.Errorf("Expected 'job_queue', got '%s'", cfg.SkipTables[1])
+	}
+}

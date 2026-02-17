@@ -7,6 +7,7 @@ import (
 
 type Config struct {
 	TableConfigs    []TableConfig       `json:"tables"`
+	SkipTables      []string            `json:"skipTables,omitempty"`
 	RowVariables    map[string]Template `json:"rowVariables,omitempty"`
 	ColumnVariables map[string]Template `json:"columnVariables,omitempty"`
 	GlobalVariables map[string]Template `json:"globalVariables,omitempty"`
@@ -23,6 +24,7 @@ type Template string
 
 type TableConfig struct {
 	TableName       string              `json:"name"`
+	Skip            bool                `json:"skip,omitempty"`
 	Columns         []ColumnConfig      `json:"columns"`
 	RowVariables    map[string]Template `json:"rowVariables,omitempty"`
 	ColumnVariables map[string]Template `json:"columnVariables,omitempty"`
