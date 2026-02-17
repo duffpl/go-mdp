@@ -363,14 +363,16 @@ func readStatements(input io.Reader, ctx context.Context) (chan string, chan err
 			default:
 			}
 			line, err := bufferedInput.ReadString('\n')
-			if err == io.EOF {
-				return
-			} else if err != nil {
+			if err != nil && err != io.EOF {
 				errCh <- err
 				return
 			}
+			isEOF := err == io.EOF
 			line = strings.TrimSpace(line)
 			if len(line) == 0 {
+				if isEOF {
+					return
+				}
 				outputCh <- line
 				continue
 			}
@@ -379,13 +381,17 @@ func readStatements(input io.Reader, ctx context.Context) (chan string, chan err
 				errCh <- err
 				return
 			}
-			//currentStatementLine += line + "\n"
 			lastCharacter := line[len(line)-1:]
 			if lastCharacter == ";" {
 				outputCh <- currentStatementLine.String()
 				currentStatementLine = strings.Builder{}
-			} else {
-				continue
+			}
+			if isEOF {
+				remaining := strings.TrimSpace(currentStatementLine.String())
+				if len(remaining) > 0 {
+					outputCh <- remaining + "\n"
+				}
+				return
 			}
 		}
 	}()
