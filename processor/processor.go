@@ -62,7 +62,7 @@ func NewProcessor(config config.Config) (*Processor, error) {
 		schemaMapLock:        schemaLock,
 		schemaReadyCond:      sync.NewCond(schemaLock),
 	}
-	globalVariables, err := p.renderGlobalVariables()
+	globalVariables, err := renderGlobalVariables(config)
 	if err != nil {
 		return nil, fmt.Errorf("cannot render global variables: %w", err)
 	}
@@ -603,31 +603,6 @@ func (p Processor) Process(input io.Reader, output io.Writer, pCtx context.Conte
 	}
 }
 
-func (p Processor) renderGlobalVariables() (map[string]string, error) {
-	compiled, err := templates.CompileTemplates(p.Config.GlobalVariables, "TableVariables")
-	if err != nil {
-		return nil, fmt.Errorf("cannot compile global variables templates: %w", err)
-	}
-	ordered, err := templates.GetOrderedTemplates(compiled)
-	if err != nil {
-		return nil, fmt.Errorf("cannot resolve global variables order: %w", err)
-	}
-	result := make(map[string]string, len(ordered))
-	for _, tmpl := range ordered {
-		output := new(bytes.Buffer)
-		err := tmpl.CompiledTemplate.Execute(output, struct {
-			GlobalVariables map[string]string
-		}{
-			GlobalVariables: result,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("cannot render global variables template '%s': %w", tmpl.Name, err)
-		}
-		shortName, _ := strings.CutPrefix(tmpl.Name, ".GlobalVariables.")
-		result[shortName] = output.String()
-	}
-	return result, nil
-}
 
 type PreparedColumnOp struct {
 	Type             string             // "template" or "json"
