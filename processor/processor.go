@@ -23,6 +23,22 @@ import (
 	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
 )
 
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
+
+func getBuffer() *bytes.Buffer {
+	buf := bufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	return buf
+}
+
+func putBuffer(buf *bytes.Buffer) {
+	bufferPool.Put(buf)
+}
+
 type Processor struct {
 	Config               config.Config
 	tableTransformations map[string]*PreparedTableConfig
@@ -185,12 +201,15 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 						if err != nil {
 							return "", fmt.Errorf("cannot render column variables: %w", err)
 						}
-						transformedValue := new(bytes.Buffer)
+						transformedValue := getBuffer()
 						err := op.CompiledTemplate.CompiledTemplate.Execute(transformedValue, columnData)
 						if err != nil {
+							putBuffer(transformedValue)
 							return "", fmt.Errorf("cannot apply transform: %w", err)
 						}
-						currentRow[columnIdx] = ast.NewValueExpr(transformedValue.String(), mysql.UTF8Charset, mysql.UTF8Charset)
+						result := transformedValue.String()
+						putBuffer(transformedValue)
+						currentRow[columnIdx] = ast.NewValueExpr(result, mysql.UTF8Charset, mysql.UTF8Charset)
 					case "json":
 						currentValue := currentRow[columnIdx].(ast.ValueExpr).GetString()
 						columnData := &columnTemplateData{
@@ -230,21 +249,27 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 				if err != nil {
 					return "", fmt.Errorf("cannot render column variables: %w", err)
 				}
-				transformedValue := new(bytes.Buffer)
+				transformedValue := getBuffer()
 				err := tmpl.CompiledTemplate.Execute(transformedValue, columnData)
 				if err != nil {
+					putBuffer(transformedValue)
 					return "", fmt.Errorf("cannot apply transform: %w", err)
 				}
-				currentRow[columnIdx] = ast.NewValueExpr(transformedValue.String(), mysql.UTF8Charset, mysql.UTF8Charset)
+				result := transformedValue.String()
+				putBuffer(transformedValue)
+				currentRow[columnIdx] = ast.NewValueExpr(result, mysql.UTF8Charset, mysql.UTF8Charset)
 			}
 		}
 	}
-	buf := new(bytes.Buffer)
+	buf := getBuffer()
 	err = stmt.Restore(format.NewRestoreCtx(restoreFlags, buf))
 	if err != nil {
+		putBuffer(buf)
 		return "", fmt.Errorf("cannot restore insert statement: %w", err)
 	}
-	return buf.String() + ";\n", nil
+	result := buf.String() + ";\n"
+	putBuffer(buf)
+	return result, nil
 }
 
 func renderRowVariables(
@@ -253,13 +278,15 @@ func renderRowVariables(
 ) error {
 	result := make(map[string]string)
 	for _, tmpl := range templates {
-		output := new(bytes.Buffer)
+		output := getBuffer()
 		err := tmpl.CompiledTemplate.Execute(output, data)
 		if err != nil {
+			putBuffer(output)
 			return fmt.Errorf("cannot render variable '%s' template: %w", tmpl.Name, err)
 		}
 		shortName, _ := strings.CutPrefix(tmpl.Name, ".RowVariables.")
 		result[shortName] = output.String()
+		putBuffer(output)
 		data.RowVariables = result
 	}
 	return nil
@@ -270,13 +297,15 @@ func renderColumnVariables(
 	data *columnTemplateData,
 ) error {
 	for _, tmpl := range templates {
-		output := new(bytes.Buffer)
+		output := getBuffer()
 		err := tmpl.CompiledTemplate.Execute(output, data)
 		if err != nil {
+			putBuffer(output)
 			return fmt.Errorf("cannot render variable '%s' template: %w", tmpl.Name, err)
 		}
 		shortName, _ := strings.CutPrefix(tmpl.Name, ".ColumnVariables.")
 		data.ColumnVariables[shortName] = output.String()
+		putBuffer(output)
 	}
 	return nil
 }
