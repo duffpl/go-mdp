@@ -29,19 +29,11 @@ func init() {
 	templateFuncs["md5"] = func(input string) string {
 		return Md5(input)
 	}
-	templateFuncs["argon2Hash"] = func(input string) string {
-		result, err := argon2Hash(input)
-		if err != nil {
-			panic(fmt.Errorf("cannot hash password: %w", err))
-		}
-		return result
+	templateFuncs["argon2Hash"] = func(input string) (string, error) {
+		return argon2Hash(input)
 	}
-	templateFuncs["bcryptHash"] = func(input string) string {
-		result, err := bcryptHash(input)
-		if err != nil {
-			panic(fmt.Errorf("cannot hash password: %w", err))
-		}
-		return result
+	templateFuncs["bcryptHash"] = func(input string) (string, error) {
+		return bcryptHash(input)
 	}
 }
 
