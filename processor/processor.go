@@ -505,7 +505,10 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 							close(work.outputChannel)
 						}
 						// Now send the error - main loop can receive it
-						errCh <- err
+						select {
+						case errCh <- err:
+						default:
+						}
 						return
 					}
 					currentLine.outputChannel <- processedLine
