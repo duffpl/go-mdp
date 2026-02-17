@@ -478,11 +478,9 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 	}()
 
 	for i := 0; i < processorCount; i++ {
+		lineProcessorsWg.Add(1)
 		go func() {
-			defer func() {
-				lineProcessorsWg.Done()
-			}()
-			lineProcessorsWg.Add(1)
+			defer lineProcessorsWg.Done()
 			stmtParser := parser.New()
 			for {
 				select {
