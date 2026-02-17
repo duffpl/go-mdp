@@ -30,7 +30,6 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"io"
-	"io/ioutil"
 	"os"
 )
 
@@ -88,7 +87,7 @@ func initProcessor(cmd *cobra.Command) (*processor.Processor, error) {
 			if err != nil {
 				return nil, fmt.Errorf("cannot create gzip reader: %w", err)
 			}
-			configData, err = ioutil.ReadAll(gr)
+			configData, err = io.ReadAll(gr)
 			if err != nil {
 				return nil, fmt.Errorf("cannot read gzip data: %w", err)
 			}
@@ -98,7 +97,7 @@ func initProcessor(cmd *cobra.Command) (*processor.Processor, error) {
 		if err != nil {
 			return nil, fmt.Errorf("cannot read config filename flag: %w", err)
 		}
-		configData, err = ioutil.ReadFile(configFilename)
+		configData, err = os.ReadFile(configFilename)
 		if err != nil {
 			return nil, fmt.Errorf("cannot read config file: %w", err)
 		}
