@@ -67,6 +67,9 @@ func NewProcessor(config config.Config) (*Processor, error) {
 	return p, nil
 }
 
+// ProcessedTables returns a sorted list of all table names encountered in
+// CREATE TABLE statements during the most recent Process() call.
+// Must be called after Process() returns.
 func (p *Processor) ProcessedTables() []string {
 	result := make([]string, len(p.processedTables))
 	copy(result, p.processedTables)
@@ -567,6 +570,7 @@ var restoreFlags = format.RestoreStringSingleQuotes |
 	format.RestoreStringEscapeBackslash
 
 func (p *Processor) Process(input io.Reader, output io.Writer, pCtx context.Context) (err error) {
+	p.processedTables = nil // reset for this call
 	readLines, inputErrors := readStatements(input, pCtx)
 	processedLinesChans, processingErrors := p.processLines(readLines, pCtx)
 	done := make(chan error, 1)
@@ -642,7 +646,7 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 	}
 	for _, tableConfig := range configData.TableConfigs {
 		preparedTableConfig, err := func() (*PreparedTableConfig, error) {
-			if tableConfig.Skip && len(tableConfig.Columns) == 0 {
+			if tableConfig.Skip {
 				return &PreparedTableConfig{Skip: true}, nil
 			}
 			allTemplates := make(map[string]config.Template)
