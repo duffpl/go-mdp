@@ -62,9 +62,9 @@ func (c *ColumnConfig) UnmarshalJSON(bytes []byte) error {
 	}
 	type transformationRaw struct {
 		Type       string         `json:"type"`
-		Template   string         `json:"template"`   // flat format: {"template": "..."}
-		JsonFields []jsonFieldRaw `json:"json"`        // flat format: {"json": [{...}]}
-		Options    optionsRaw     `json:"options"`     // nested format: {"type": "...", "options": {...}}
+		Template   string         `json:"template"` // flat format: {"template": "..."}
+		JsonFields []jsonFieldRaw `json:"json"`     // flat format: {"json": [{...}]}
+		Options    optionsRaw     `json:"options"`  // nested format: {"type": "...", "options": {...}}
 	}
 	type columnRaw struct {
 		Name            string              `json:"name"`

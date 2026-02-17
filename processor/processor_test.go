@@ -921,6 +921,36 @@ func TestProcessor_ProcessedTables_ReturnsNewSlice(t *testing.T) {
 	}
 }
 
+func TestProcessor_ProcessedTables_ResetsOnSecondProcess(t *testing.T) {
+	cfg := config.Config{}
+	processor, err := NewProcessor(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	// First Process call with users.sql
+	input1 := strings.NewReader(loadFixture(t, "users.sql"))
+	err = processor.Process(input1, &bytes.Buffer{}, context.Background())
+	if err != nil {
+		t.Fatalf("First Process failed: %v", err)
+	}
+	tables1 := processor.ProcessedTables()
+	if len(tables1) != 1 || tables1[0] != "users" {
+		t.Fatalf("Expected [users] after first Process, got %v", tables1)
+	}
+
+	// Second Process call with orders.sql
+	input2 := strings.NewReader(loadFixture(t, "orders.sql"))
+	err = processor.Process(input2, &bytes.Buffer{}, context.Background())
+	if err != nil {
+		t.Fatalf("Second Process failed: %v", err)
+	}
+	tables2 := processor.ProcessedTables()
+	if len(tables2) != 1 || tables2[0] != "orders" {
+		t.Errorf("Expected [orders] after second Process (reset), got %v", tables2)
+	}
+}
+
 func TestProcessor_SkipTable_WithColumnConfigs_SkipTakesPrecedence(t *testing.T) {
 	cfg := config.Config{
 		SkipTables: []string{"audit_log"},
