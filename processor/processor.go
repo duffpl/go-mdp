@@ -90,15 +90,28 @@ func (p *Processor) processCreateTableStatement(stmt *ast.CreateTableStmt) {
 	p.schemaMapLock.Unlock()
 }
 
-// waitForSchema blocks until the schema for tableName is available
-func (p *Processor) waitForSchema(tableName string) TableSchema {
+// waitForSchema blocks until the schema for tableName is available or context is cancelled
+func (p *Processor) waitForSchema(ctx context.Context, tableName string) (TableSchema, error) {
 	p.schemaMapLock.Lock()
 	defer p.schemaMapLock.Unlock()
 	for {
 		if schema, ok := p.tableSchemas[tableName]; ok {
-			return schema
+			return schema, nil
 		}
-		p.schemaReadyCond.Wait() // releases lock, waits for signal, re-acquires lock
+		if ctx.Err() != nil {
+			return TableSchema{}, fmt.Errorf("context cancelled while waiting for schema of table %s: %w", tableName, ctx.Err())
+		}
+		// Wake up when context is cancelled so we don't block forever
+		done := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				p.schemaReadyCond.Broadcast()
+			case <-done:
+			}
+		}()
+		p.schemaReadyCond.Wait()
+		close(done)
 	}
 }
 
@@ -129,10 +142,13 @@ func mapInsertRowToColumns(insertRow []ast.ExprNode, tableSchema TableSchema) (t
 	return result, nil
 }
 
-func (p *Processor) processInsertStatement(stmt *ast.InsertStmt, tableConfig *PreparedTableConfig, startRowIndex int) (string, error) {
+func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.InsertStmt, tableConfig *PreparedTableConfig, startRowIndex int) (string, error) {
 	tableName := stmt.Table.TableRefs.Left.(*ast.TableSource).Source.(*ast.TableName).Name.String()
 	// Wait for schema to be available (CREATE TABLE must be processed first)
-	schema := p.waitForSchema(tableName)
+	schema, err := p.waitForSchema(ctx, tableName)
+	if err != nil {
+		return "", err
+	}
 	allInsertRows := stmt.Lists
 	for currentRowIndex := range allInsertRows {
 		// Use pre-computed row index (no lock needed)
@@ -237,7 +253,7 @@ func (p *Processor) processInsertStatement(stmt *ast.InsertStmt, tableConfig *Pr
 		}
 	}
 	buf := new(bytes.Buffer)
-	err := stmt.Restore(format.NewRestoreCtx(restoreFlags, buf))
+	err = stmt.Restore(format.NewRestoreCtx(restoreFlags, buf))
 	if err != nil {
 		return "", fmt.Errorf("cannot restore insert statement: %w", err)
 	}
@@ -376,7 +392,7 @@ func readStatements(input io.Reader, ctx context.Context) (chan string, chan err
 	return outputCh, errCh
 }
 
-func (p Processor) processLine(line string, parser *parser.Parser, startRowIndex int) (string, error) {
+func (p Processor) processLine(ctx context.Context, line string, parser *parser.Parser, startRowIndex int) (string, error) {
 	var tableName string
 	preparseResult := preparse(line)
 	switch preparseResult.(type) {
@@ -396,7 +412,7 @@ func (p Processor) processLine(line string, parser *parser.Parser, startRowIndex
 	statement := parseResult[0]
 	switch statement.(type) {
 	case *ast.InsertStmt:
-		line, err = p.processInsertStatement(statement.(*ast.InsertStmt), tableTransformations, startRowIndex)
+		line, err = p.processInsertStatement(ctx, statement.(*ast.InsertStmt), tableTransformations, startRowIndex)
 		if err != nil {
 			return line, fmt.Errorf("cannot process insert statement for table %s: %w", tableName, err)
 		}
@@ -494,7 +510,7 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 					if !ok {
 						return
 					}
-					processedLine, err := p.processLine(currentLine.line, stmtParser, currentLine.startRowIndex)
+					processedLine, err := p.processLine(processingCtx, currentLine.line, stmtParser, currentLine.startRowIndex)
 					if err != nil {
 						currentLine.outputChannel <- fmt.Sprintf("/* error: %s */\n%s", err.Error(), currentLine.line)
 						// Cancel processing context to stop all goroutines
