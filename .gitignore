@@ -1,6 +1,7 @@
 .idea
 build
 *.sql
+!processor/testdata/fixtures/*.sql
 go-mdp
 config*
 handoffs/
