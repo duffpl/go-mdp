@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -242,6 +243,46 @@ func TestColumnConfig_UnmarshalJSON_FlatMixedFormats(t *testing.T) {
 	}
 	if col.Operations[1].JsonFields[0].Path != "name" {
 		t.Errorf("Expected path 'name', got '%s'", col.Operations[1].JsonFields[0].Path)
+	}
+}
+
+func TestColumnConfig_UnmarshalJSON_AmbiguousTemplate(t *testing.T) {
+	// Both flat template and options.template set — should error
+	input := `{
+		"name": "email",
+		"transformations": [
+			{"template": "flat", "options": {"template": "nested"}}
+		]
+	}`
+	var col ColumnConfig
+	err := json.Unmarshal([]byte(input), &col)
+	if err == nil {
+		t.Fatal("Expected error for ambiguous template, got nil")
+	}
+	if !strings.Contains(err.Error(), "ambiguous") {
+		t.Errorf("Expected ambiguous error, got: %s", err)
+	}
+}
+
+func TestColumnConfig_UnmarshalJSON_AmbiguousJson(t *testing.T) {
+	// Both flat json and options.fields set — should error
+	input := `{
+		"name": "metadata",
+		"transformations": [
+			{
+				"type": "json",
+				"json": [{"path": "a", "template": "x"}],
+				"options": {"fields": [{"path": "b", "template": "y"}]}
+			}
+		]
+	}`
+	var col ColumnConfig
+	err := json.Unmarshal([]byte(input), &col)
+	if err == nil {
+		t.Fatal("Expected error for ambiguous json fields, got nil")
+	}
+	if !strings.Contains(err.Error(), "ambiguous") {
+		t.Errorf("Expected ambiguous error, got: %s", err)
 	}
 }
 
