@@ -61,8 +61,10 @@ func (c *ColumnConfig) UnmarshalJSON(bytes []byte) error {
 		Fields   []jsonFieldRaw `json:"fields"`
 	}
 	type transformationRaw struct {
-		Type    string     `json:"type"`
-		Options optionsRaw `json:"options"`
+		Type       string         `json:"type"`
+		Template   string         `json:"template"`   // flat format: {"template": "..."}
+		JsonFields []jsonFieldRaw `json:"json"`        // flat format: {"json": [{...}]}
+		Options    optionsRaw     `json:"options"`     // nested format: {"type": "...", "options": {...}}
 	}
 	type columnRaw struct {
 		Name            string              `json:"name"`
@@ -81,19 +83,32 @@ func (c *ColumnConfig) UnmarshalJSON(bytes []byte) error {
 	for i, t := range raw.Transformations {
 		opType := t.Type
 		if opType == "" {
-			opType = "template"
+			switch {
+			case len(t.JsonFields) > 0:
+				opType = "json"
+			default:
+				opType = "template"
+			}
 		}
 
 		switch opType {
 		case "template":
+			tmpl := t.Options.Template
+			if tmpl == "" {
+				tmpl = t.Template
+			}
 			c.Operations[i] = ColumnOperation{
 				Type:     "template",
-				Template: Template(t.Options.Template),
+				Template: Template(tmpl),
 			}
-			c.Templates = append(c.Templates, Template(t.Options.Template))
+			c.Templates = append(c.Templates, Template(tmpl))
 		case "json":
-			fields := make([]JsonFieldConfig, len(t.Options.Fields))
-			for j, f := range t.Options.Fields {
+			rawFields := t.Options.Fields
+			if len(rawFields) == 0 {
+				rawFields = t.JsonFields
+			}
+			fields := make([]JsonFieldConfig, len(rawFields))
+			for j, f := range rawFields {
 				fields[j] = JsonFieldConfig{
 					Path:     f.Path,
 					Template: Template(f.Template),

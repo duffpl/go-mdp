@@ -115,6 +115,136 @@ func TestColumnConfig_UnmarshalJSON_DefaultType(t *testing.T) {
 	}
 }
 
+func TestColumnConfig_UnmarshalJSON_FlatFormat(t *testing.T) {
+	// Original format used by db-hub: template directly on transformation, no type/options wrapper
+	input := `{
+		"name": "electronic_address",
+		"transformations": [
+			{"template": "{{ randInt 1000000000 9999999999 }}"}
+		]
+	}`
+	var col ColumnConfig
+	err := json.Unmarshal([]byte(input), &col)
+	if err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	if col.ColumnName != "electronic_address" {
+		t.Errorf("Expected column name 'electronic_address', got '%s'", col.ColumnName)
+	}
+	if len(col.Operations) != 1 {
+		t.Fatalf("Expected 1 operation, got %d", len(col.Operations))
+	}
+	op := col.Operations[0]
+	if op.Type != "template" {
+		t.Errorf("Expected type 'template', got '%s'", op.Type)
+	}
+	if op.Template != "{{ randInt 1000000000 9999999999 }}" {
+		t.Errorf("Expected template '{{ randInt 1000000000 9999999999 }}', got '%s'", op.Template)
+	}
+	if len(col.Templates) != 1 {
+		t.Fatalf("Expected 1 template, got %d", len(col.Templates))
+	}
+	if col.Templates[0] != "{{ randInt 1000000000 9999999999 }}" {
+		t.Errorf("Expected template in Templates slice, got '%s'", col.Templates[0])
+	}
+}
+
+func TestColumnConfig_UnmarshalJSON_FlatFormatMultiple(t *testing.T) {
+	// Multiple flat-format transformations
+	input := `{
+		"name": "email",
+		"transformations": [
+			{"template": "{{ .RowMeta.Index }}@test.com"},
+			{"template": "prefix-{{ .FieldValue }}"}
+		]
+	}`
+	var col ColumnConfig
+	err := json.Unmarshal([]byte(input), &col)
+	if err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	if len(col.Operations) != 2 {
+		t.Fatalf("Expected 2 operations, got %d", len(col.Operations))
+	}
+	if col.Operations[0].Template != "{{ .RowMeta.Index }}@test.com" {
+		t.Errorf("Expected first template, got '%s'", col.Operations[0].Template)
+	}
+	if col.Operations[1].Template != "prefix-{{ .FieldValue }}" {
+		t.Errorf("Expected second template, got '%s'", col.Operations[1].Template)
+	}
+}
+
+func TestColumnConfig_UnmarshalJSON_FlatJsonFormat(t *testing.T) {
+	// Flat format for json type: "json" key directly on transformation
+	input := `{
+		"name": "metadata",
+		"transformations": [
+			{"json": [
+				{"path": "user.firstName", "template": "{{ transformFirstName .FieldValue }}"},
+				{"path": "contacts.#.email", "template": "anon-{{ .RowMeta.Index }}@test.com"}
+			]}
+		]
+	}`
+	var col ColumnConfig
+	err := json.Unmarshal([]byte(input), &col)
+	if err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	if len(col.Operations) != 1 {
+		t.Fatalf("Expected 1 operation, got %d", len(col.Operations))
+	}
+	op := col.Operations[0]
+	if op.Type != "json" {
+		t.Errorf("Expected type 'json', got '%s'", op.Type)
+	}
+	if len(op.JsonFields) != 2 {
+		t.Fatalf("Expected 2 json fields, got %d", len(op.JsonFields))
+	}
+	if op.JsonFields[0].Path != "user.firstName" {
+		t.Errorf("Expected path 'user.firstName', got '%s'", op.JsonFields[0].Path)
+	}
+	if op.JsonFields[0].Template != "{{ transformFirstName .FieldValue }}" {
+		t.Errorf("Expected template, got '%s'", op.JsonFields[0].Template)
+	}
+	if op.JsonFields[1].Path != "contacts.#.email" {
+		t.Errorf("Expected path 'contacts.#.email', got '%s'", op.JsonFields[1].Path)
+	}
+}
+
+func TestColumnConfig_UnmarshalJSON_FlatMixedFormats(t *testing.T) {
+	// Mix flat template and flat json in the same column
+	input := `{
+		"name": "data",
+		"transformations": [
+			{"template": "prefix-{{ .FieldValue }}"},
+			{"json": [{"path": "name", "template": "anon"}]}
+		]
+	}`
+	var col ColumnConfig
+	err := json.Unmarshal([]byte(input), &col)
+	if err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	if len(col.Operations) != 2 {
+		t.Fatalf("Expected 2 operations, got %d", len(col.Operations))
+	}
+	if col.Operations[0].Type != "template" {
+		t.Errorf("Expected first op type 'template', got '%s'", col.Operations[0].Type)
+	}
+	if col.Operations[0].Template != "prefix-{{ .FieldValue }}" {
+		t.Errorf("Expected template string, got '%s'", col.Operations[0].Template)
+	}
+	if col.Operations[1].Type != "json" {
+		t.Errorf("Expected second op type 'json', got '%s'", col.Operations[1].Type)
+	}
+	if len(col.Operations[1].JsonFields) != 1 {
+		t.Fatalf("Expected 1 json field, got %d", len(col.Operations[1].JsonFields))
+	}
+	if col.Operations[1].JsonFields[0].Path != "name" {
+		t.Errorf("Expected path 'name', got '%s'", col.Operations[1].JsonFields[0].Path)
+	}
+}
+
 func TestConfig_SkipTablesField(t *testing.T) {
 	input := `{
 		"skipTables": ["cache_entries", "job_queue"]

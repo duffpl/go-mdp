@@ -45,6 +45,7 @@ The resulting binary is called `go-mdp`.
 
 {
   "settings": { "locale": "default" },
+  "skipTables": ["audit_log", "job_queue"],
   "globalVariables": {
     "domain": "example.com"
   },
@@ -58,25 +59,25 @@ The resulting binary is called `go-mdp`.
         {
           "name": "email",
           "transformations": [
-            { "type": "template", "options": { "template": "user-{{ .Row.id }}@{{ .GlobalVariables.domain }}" } }
+            { "template": "user-{{ .Row.id }}@{{ .GlobalVariables.domain }}" }
           ]
         },
         {
           "name": "first_name",
           "transformations": [
-            { "type": "template", "options": { "template": "{{ transformFirstName .FieldValue }}" } }
+            { "template": "{{ transformFirstName .FieldValue }}" }
           ]
         },
         {
           "name": "last_name",
           "transformations": [
-            { "type": "template", "options": { "template": "{{ transformLastName .FieldValue }}" } }
+            { "template": "{{ transformLastName .FieldValue }}" }
           ]
         },
         {
           "name": "password",
           "transformations": [
-            { "type": "template", "options": { "template": "{{ bcryptHash \"changeme\" }}" } }
+            { "template": "{{ bcryptHash \"changeme\" }}" }
           ]
         }
       ]
@@ -111,6 +112,7 @@ Example: inlining a compressed config
 ## Configuration reference (JSON)
 Top-level:
 - settings.locale: locale for fake data helpers; one of: default, fi, se, no, dk
+- skipTables: array of table names whose INSERT statements should be dropped (CREATE TABLE is preserved)
 - globalVariables: name -> template string evaluated once globally (can reference previously defined global variables)
 - tableVariables: name -> template string evaluated per-table (can reference global + already defined table vars)
 - rowVariables: name -> template string evaluated per row (has access to row data and counters)
@@ -125,14 +127,23 @@ Table config:
 
 Column config:
 - name: column name
-- transformations: array of objects with shape:
-  { "type": "template" | "value", "options": { ... } }
-  - type: template
-    - options.template: Go template string; output replaces the value
-  - type: value
-    - options.value: static value to set (string, number, etc.)
+- transformations: array of transformation objects (two formats supported):
 
-Note: Internally, all transformations are executed via compiled templates. The `value` type is equivalent to a template that outputs a constant.
+  Flat format (simpler):
+    { "template": "{{ .FieldValue }}@example.com" }
+    { "json": [ { "path": "user.name", "template": "anon" } ] }
+
+  Nested format:
+    { "type": "template", "options": { "template": "{{ .FieldValue }}@example.com" } }
+    { "type": "json", "options": { "fields": [ { "path": "user.name", "template": "anon" } ] } }
+
+  Both formats can be mixed in the same config. When type is omitted, it is inferred from the key ("template" or "json").
+
+  Transformation types:
+  - template: Go template string; output replaces the column value
+  - json: transform fields inside a JSON column value
+    - options.fields: array of { "path": "json.path", "template": "..." }
+    - path uses GJSON syntax (e.g. "user.name", "contacts.#.email")
 
 
 ## Template data model
@@ -191,7 +202,7 @@ Performance notes
       {
         "name": "users",
         "columns": [
-          { "name": "email", "transformations": [ { "type": "template", "options": { "template": "user-{{ .Row.id }}@example.com" } } ] }
+          { "name": "email", "transformations": [ { "template": "user-{{ .Row.id }}@example.com" } ] }
         ]
       }
     ]
