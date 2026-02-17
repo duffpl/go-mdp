@@ -153,6 +153,14 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 	}
 	allInsertRows := stmt.Lists
 	reusableRow := make(transformations.MappedRow, len(schema.Columns))
+	rowData := &rowTemplateData{
+		RowVariables:    make(map[string]string),
+		GlobalVariables: tableConfig.GlobalVariables,
+		TableVariables:  tableConfig.TableVariables,
+	}
+	columnData := &columnTemplateData{
+		ColumnVariables: make(map[string]string),
+	}
 	for currentRowIndex := range allInsertRows {
 		// Use pre-computed row index (no lock needed)
 		tableRowIndex := startRowIndex + currentRowIndex
@@ -161,16 +169,10 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 		if err != nil {
 			return "", fmt.Errorf("cannot map row: %w", err)
 		}
-		rowMeta := transformations.RowMeta{
-			Index: tableRowIndex,
-		}
-		rowData := &rowTemplateData{
-			Row:             reusableRow,
-			RowMeta:         rowMeta,
-			RowVariables:    make(map[string]string),
-			GlobalVariables: tableConfig.GlobalVariables,
-			TableVariables:  tableConfig.TableVariables,
-		}
+		clear(rowData.RowVariables)
+		rowData.Row = reusableRow
+		rowData.RowMeta = transformations.RowMeta{Index: tableRowIndex}
+
 		err = renderRowVariables(
 			tableConfig.RowVariableTemplates,
 			rowData,
@@ -190,11 +192,9 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 					case "template":
 						currentColumn := currentRow[columnIdx]
 						columnVariablesTemplates := tableConfig.ColumnVariableDepsPerTemplate[op.CompiledTemplate]
-						columnData := &columnTemplateData{
-							rowTemplateData: *rowData,
-							FieldValue:      currentColumn.(ast.ValueExpr).GetString(),
-							ColumnVariables: make(map[string]string),
-						}
+						columnData.rowTemplateData = *rowData
+						columnData.FieldValue = currentColumn.(ast.ValueExpr).GetString()
+						clear(columnData.ColumnVariables)
 						err = renderColumnVariables(columnVariablesTemplates, columnData)
 						if err != nil {
 							return "", fmt.Errorf("cannot render column variables: %w", err)
@@ -210,11 +210,9 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 						currentRow[columnIdx] = ast.NewValueExpr(result, mysql.UTF8Charset, mysql.UTF8Charset)
 					case "json":
 						currentValue := currentRow[columnIdx].(ast.ValueExpr).GetString()
-						columnData := &columnTemplateData{
-							rowTemplateData: *rowData,
-							FieldValue:      currentValue,
-							ColumnVariables: make(map[string]string),
-						}
+						columnData.rowTemplateData = *rowData
+						columnData.FieldValue = currentValue
+						clear(columnData.ColumnVariables)
 						transformedJSON, err := applyJsonTransform(currentValue, op.JsonFields, columnData)
 						if err != nil {
 							return "", fmt.Errorf("JSON transform failed for column '%s': %w", columnSchema.Name, err)
@@ -236,11 +234,9 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 					return "", fmt.Errorf("cannot get transformation function: %w", err)
 				}
 				columnVariablesTemplates := tableConfig.ColumnVariableDepsPerTemplate[tmpl]
-				columnData := &columnTemplateData{
-					rowTemplateData: *rowData,
-					FieldValue:      currentColumn.(ast.ValueExpr).GetString(),
-					ColumnVariables: make(map[string]string),
-				}
+				columnData.rowTemplateData = *rowData
+				columnData.FieldValue = currentColumn.(ast.ValueExpr).GetString()
+				clear(columnData.ColumnVariables)
 				err = renderColumnVariables(columnVariablesTemplates, columnData)
 				if err != nil {
 					return "", fmt.Errorf("cannot render column variables: %w", err)
@@ -272,7 +268,6 @@ func renderRowVariables(
 	templates []*templates.Template,
 	data *rowTemplateData,
 ) error {
-	result := make(map[string]string)
 	for _, tmpl := range templates {
 		output := getBuffer()
 		err := tmpl.CompiledTemplate.Execute(output, data)
@@ -281,9 +276,8 @@ func renderRowVariables(
 			return fmt.Errorf("cannot render variable '%s' template: %w", tmpl.Name, err)
 		}
 		shortName, _ := strings.CutPrefix(tmpl.Name, ".RowVariables.")
-		result[shortName] = output.String()
+		data.RowVariables[shortName] = output.String()
 		putBuffer(output)
-		data.RowVariables = result
 	}
 	return nil
 }
