@@ -737,6 +737,31 @@ func TestProcessor_JsonTransform_FromJSONConfig(t *testing.T) {
 	}
 }
 
+func TestProcessor_SkipTable_DropsInsert(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "audit_log",
+				Skip:      true,
+			},
+		},
+	}
+
+	input := loadFixture(t, "audit_log.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if !strings.Contains(output, "CREATE TABLE") {
+		t.Error("CREATE TABLE should be preserved for skipped tables")
+	}
+	lowered := strings.ToLower(output)
+	if strings.Contains(lowered, "insert into") {
+		t.Error("INSERT should be dropped for skipped tables")
+	}
+}
+
 // Benchmark configuration for anonymizing benchmark_users table
 func benchmarkConfig() config.Config {
 	return config.Config{

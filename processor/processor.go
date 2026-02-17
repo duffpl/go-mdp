@@ -398,6 +398,12 @@ func (p Processor) processLine(ctx context.Context, line string, parser *parser.
 	if !ok {
 		return line, nil // passthrough: table not configured
 	}
+	// Skip INSERT statements for tables with Skip=true (before AST parsing for performance)
+	if tableTransformations.Skip {
+		if _, isInsert := preparseResult.(preparsedInsertStmt); isInsert {
+			return "", nil
+		}
+	}
 	parseResult, _, err := parser.Parse(line, mysql.UTF8Charset, mysql.UTF8Charset)
 	if err != nil {
 		return line, fmt.Errorf("cannot parse statement for table %s: %w", tableName, err)
@@ -595,6 +601,7 @@ type PreparedColumnOp struct {
 }
 
 type PreparedTableConfig struct {
+	Skip                    bool
 	ColumnOps               map[string][]PreparedColumnOp
 	ColumnTemplates         map[string][]*templates.Template
 	ColumnVariableTemplates map[string]*templates.Template
@@ -611,6 +618,9 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 	}
 	for _, tableConfig := range configData.TableConfigs {
 		preparedTableConfig, err := func() (*PreparedTableConfig, error) {
+			if tableConfig.Skip && len(tableConfig.Columns) == 0 {
+				return &PreparedTableConfig{Skip: true}, nil
+			}
 			allTemplates := make(map[string]config.Template)
 			for name, tmpl := range configData.TableVariables {
 				allTemplates[".TableVariables."+name] = tmpl
@@ -724,6 +734,7 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 				return nil, fmt.Errorf("cannot render table variables: %w", err)
 			}
 			preparedTableConfig := &PreparedTableConfig{
+				Skip:                    tableConfig.Skip,
 				GlobalVariables:         renderedGlobalVariables,
 				TableVariables:          rendererTableVariables,
 				RowVariableTemplates:    rowVariableTemplates,
