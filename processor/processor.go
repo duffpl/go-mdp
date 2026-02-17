@@ -13,7 +13,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/bobg/go-generics/v3/slices"
 	"github.com/duffpl/go-mdp/v2/config"
 	"github.com/duffpl/go-mdp/v2/templates"
 	"github.com/duffpl/go-mdp/v2/transformations"
@@ -23,6 +22,22 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
 )
+
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
+
+func getBuffer() *bytes.Buffer {
+	buf := bufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	return buf
+}
+
+func putBuffer(buf *bytes.Buffer) {
+	bufferPool.Put(buf)
+}
 
 type Processor struct {
 	Config               config.Config
@@ -136,17 +151,17 @@ type columnTemplateData struct {
 	FieldValue      interface{}
 }
 
-func mapInsertRowToColumns(insertRow []ast.ExprNode, tableSchema TableSchema) (transformations.MappedRow, error) {
-	result := make(transformations.MappedRow)
+func mapInsertRowToColumns(insertRow []ast.ExprNode, tableSchema TableSchema, result transformations.MappedRow) error {
+	clear(result)
 	for i := range insertRow {
 		field, ok := insertRow[i].(ast.ValueExpr)
 		if !ok {
-			return nil, fmt.Errorf("cannot cast column value (%T)", insertRow[i])
+			return fmt.Errorf("cannot cast column value (%T)", insertRow[i])
 		}
 		column := tableSchema.Columns[i]
 		result[column.Name] = field.GetValue()
 	}
-	return result, nil
+	return nil
 }
 
 func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.InsertStmt, tableConfig *PreparedTableConfig, startRowIndex int) (string, error) {
@@ -157,24 +172,27 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 		return "", err
 	}
 	allInsertRows := stmt.Lists
+	reusableRow := make(transformations.MappedRow, len(schema.Columns))
+	rowData := &rowTemplateData{
+		RowVariables:    make(map[string]string),
+		GlobalVariables: tableConfig.GlobalVariables,
+		TableVariables:  tableConfig.TableVariables,
+	}
+	columnData := &columnTemplateData{
+		ColumnVariables: make(map[string]string),
+	}
 	for currentRowIndex := range allInsertRows {
 		// Use pre-computed row index (no lock needed)
 		tableRowIndex := startRowIndex + currentRowIndex
 		currentRow := allInsertRows[currentRowIndex]
-		mappedRow, err := mapInsertRowToColumns(currentRow, schema)
+		err := mapInsertRowToColumns(currentRow, schema, reusableRow)
 		if err != nil {
 			return "", fmt.Errorf("cannot map row: %w", err)
 		}
-		rowMeta := transformations.RowMeta{
-			Index: tableRowIndex,
-		}
-		rowData := &rowTemplateData{
-			Row:             mappedRow,
-			RowMeta:         rowMeta,
-			RowVariables:    make(map[string]string),
-			GlobalVariables: tableConfig.GlobalVariables,
-			TableVariables:  tableConfig.TableVariables,
-		}
+		clear(rowData.RowVariables)
+		rowData.Row = reusableRow
+		rowData.RowMeta = transformations.RowMeta{Index: tableRowIndex}
+
 		err = renderRowVariables(
 			tableConfig.RowVariableTemplates,
 			rowData,
@@ -193,31 +211,28 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 					switch op.Type {
 					case "template":
 						currentColumn := currentRow[columnIdx]
-						columnVariablesTemplates := slices.Filter(op.CompiledTemplate.Dependencies, func(tmpl *templates.Template) bool {
-							return strings.HasPrefix(tmpl.Name, ".ColumnVariables")
-						})
-						columnData := &columnTemplateData{
-							rowTemplateData: *rowData,
-							FieldValue:      currentColumn.(ast.ValueExpr).GetString(),
-							ColumnVariables: make(map[string]string),
-						}
+						columnVariablesTemplates := tableConfig.ColumnVariableDepsPerTemplate[op.CompiledTemplate]
+						columnData.rowTemplateData = *rowData
+						columnData.FieldValue = currentColumn.(ast.ValueExpr).GetString()
+						clear(columnData.ColumnVariables)
 						err = renderColumnVariables(columnVariablesTemplates, columnData)
 						if err != nil {
 							return "", fmt.Errorf("cannot render column variables: %w", err)
 						}
-						transformedValue := new(bytes.Buffer)
+						transformedValue := getBuffer()
 						err := op.CompiledTemplate.CompiledTemplate.Execute(transformedValue, columnData)
 						if err != nil {
+							putBuffer(transformedValue)
 							return "", fmt.Errorf("cannot apply transform: %w", err)
 						}
-						currentRow[columnIdx] = ast.NewValueExpr(transformedValue.String(), mysql.UTF8Charset, mysql.UTF8Charset)
+						result := transformedValue.String()
+						putBuffer(transformedValue)
+						currentRow[columnIdx] = ast.NewValueExpr(result, mysql.UTF8Charset, mysql.UTF8Charset)
 					case "json":
 						currentValue := currentRow[columnIdx].(ast.ValueExpr).GetString()
-						columnData := &columnTemplateData{
-							rowTemplateData: *rowData,
-							FieldValue:      currentValue,
-							ColumnVariables: make(map[string]string),
-						}
+						columnData.rowTemplateData = *rowData
+						columnData.FieldValue = currentValue
+						clear(columnData.ColumnVariables)
 						transformedJSON, err := applyJsonTransform(currentValue, op.JsonFields, columnData)
 						if err != nil {
 							return "", fmt.Errorf("JSON transform failed for column '%s': %w", columnSchema.Name, err)
@@ -238,49 +253,51 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 				if err != nil {
 					return "", fmt.Errorf("cannot get transformation function: %w", err)
 				}
-				columnVariablesTemplates := slices.Filter(tmpl.Dependencies, func(tmpl *templates.Template) bool {
-					return strings.HasPrefix(tmpl.Name, ".ColumnVariables")
-				})
-				columnData := &columnTemplateData{
-					rowTemplateData: *rowData,
-					FieldValue:      currentColumn.(ast.ValueExpr).GetString(),
-					ColumnVariables: make(map[string]string),
-				}
+				columnVariablesTemplates := tableConfig.ColumnVariableDepsPerTemplate[tmpl]
+				columnData.rowTemplateData = *rowData
+				columnData.FieldValue = currentColumn.(ast.ValueExpr).GetString()
+				clear(columnData.ColumnVariables)
 				err = renderColumnVariables(columnVariablesTemplates, columnData)
 				if err != nil {
 					return "", fmt.Errorf("cannot render column variables: %w", err)
 				}
-				transformedValue := new(bytes.Buffer)
+				transformedValue := getBuffer()
 				err := tmpl.CompiledTemplate.Execute(transformedValue, columnData)
 				if err != nil {
+					putBuffer(transformedValue)
 					return "", fmt.Errorf("cannot apply transform: %w", err)
 				}
-				currentRow[columnIdx] = ast.NewValueExpr(transformedValue.String(), mysql.UTF8Charset, mysql.UTF8Charset)
+				result := transformedValue.String()
+				putBuffer(transformedValue)
+				currentRow[columnIdx] = ast.NewValueExpr(result, mysql.UTF8Charset, mysql.UTF8Charset)
 			}
 		}
 	}
-	buf := new(bytes.Buffer)
+	buf := getBuffer()
 	err = stmt.Restore(format.NewRestoreCtx(restoreFlags, buf))
 	if err != nil {
+		putBuffer(buf)
 		return "", fmt.Errorf("cannot restore insert statement: %w", err)
 	}
-	return buf.String() + ";\n", nil
+	result := buf.String() + ";\n"
+	putBuffer(buf)
+	return result, nil
 }
 
 func renderRowVariables(
 	templates []*templates.Template,
 	data *rowTemplateData,
 ) error {
-	result := make(map[string]string)
 	for _, tmpl := range templates {
-		output := new(bytes.Buffer)
+		output := getBuffer()
 		err := tmpl.CompiledTemplate.Execute(output, data)
 		if err != nil {
+			putBuffer(output)
 			return fmt.Errorf("cannot render variable '%s' template: %w", tmpl.Name, err)
 		}
 		shortName, _ := strings.CutPrefix(tmpl.Name, ".RowVariables.")
-		result[shortName] = output.String()
-		data.RowVariables = result
+		data.RowVariables[shortName] = output.String()
+		putBuffer(output)
 	}
 	return nil
 }
@@ -290,13 +307,15 @@ func renderColumnVariables(
 	data *columnTemplateData,
 ) error {
 	for _, tmpl := range templates {
-		output := new(bytes.Buffer)
+		output := getBuffer()
 		err := tmpl.CompiledTemplate.Execute(output, data)
 		if err != nil {
+			putBuffer(output)
 			return fmt.Errorf("cannot render variable '%s' template: %w", tmpl.Name, err)
 		}
 		shortName, _ := strings.CutPrefix(tmpl.Name, ".ColumnVariables.")
 		data.ColumnVariables[shortName] = output.String()
+		putBuffer(output)
 	}
 	return nil
 }
@@ -405,9 +424,8 @@ func readStatements(input io.Reader, ctx context.Context) (chan string, chan err
 	return outputCh, errCh
 }
 
-func (p *Processor) processLine(ctx context.Context, line string, parser *parser.Parser, startRowIndex int) (string, error) {
+func (p *Processor) processLine(ctx context.Context, line string, parser *parser.Parser, startRowIndex int, preparseResult preparsedStatement) (string, error) {
 	var tableName string
-	preparseResult := preparse(line)
 	switch v := preparseResult.(type) {
 	case nil:
 		return line, nil // passthrough: not a CREATE/INSERT
@@ -451,7 +469,8 @@ func (p *Processor) processLine(ctx context.Context, line string, parser *parser
 type lineWithOutputChannel struct {
 	line          string
 	outputChannel chan string
-	startRowIndex int // pre-computed starting row index for this statement
+	startRowIndex int                // pre-computed starting row index for this statement
+	preparsed     preparsedStatement // pre-computed statement type to avoid duplicate regex work
 }
 
 // countInsertRows quickly counts the number of value tuples in an INSERT statement
@@ -508,6 +527,7 @@ func (p *Processor) processLines(input chan string, ctx context.Context) (chan c
 				line:          line,
 				outputChannel: processedCh,
 				startRowIndex: startRowIndex,
+				preparsed:     preparsed,
 			}:
 			case <-processingCtx.Done():
 				close(processedCh)
@@ -533,7 +553,7 @@ func (p *Processor) processLines(input chan string, ctx context.Context) (chan c
 					if !ok {
 						return
 					}
-					processedLine, err := p.processLine(processingCtx, currentLine.line, stmtParser, currentLine.startRowIndex)
+					processedLine, err := p.processLine(processingCtx, currentLine.line, stmtParser, currentLine.startRowIndex, currentLine.preparsed)
 					if err != nil {
 						currentLine.outputChannel <- fmt.Sprintf("/* error: %s */\n%s", err.Error(), currentLine.line)
 						// Cancel processing context to stop all goroutines
@@ -629,13 +649,14 @@ type PreparedColumnOp struct {
 }
 
 type PreparedTableConfig struct {
-	Skip                    bool
-	ColumnOps               map[string][]PreparedColumnOp
-	ColumnTemplates         map[string][]*templates.Template
-	ColumnVariableTemplates map[string]*templates.Template
-	GlobalVariables         map[string]string
-	TableVariables          map[string]string
-	RowVariableTemplates    []*templates.Template
+	Skip                          bool
+	ColumnOps                     map[string][]PreparedColumnOp
+	ColumnTemplates               map[string][]*templates.Template
+	ColumnVariableTemplates       map[string]*templates.Template
+	ColumnVariableDepsPerTemplate map[*templates.Template][]*templates.Template
+	GlobalVariables               map[string]string
+	TableVariables                map[string]string
+	RowVariableTemplates          []*templates.Template
 }
 
 func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableConfig, error) {
@@ -754,17 +775,48 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 					ops[mapping.opIndex].CompiledTemplate = compiledTmpl
 				}
 			}
+			// Precompute column variable dependency filter per template
+			columnVariableDeps := make(map[*templates.Template][]*templates.Template)
+			for _, colTemplates := range columnTemplates {
+				for _, tmpl := range colTemplates {
+					if tmpl == nil {
+						continue
+					}
+					var deps []*templates.Template
+					for _, dep := range tmpl.Dependencies {
+						if strings.HasPrefix(dep.Name, ".ColumnVariables") {
+							deps = append(deps, dep)
+						}
+					}
+					columnVariableDeps[tmpl] = deps
+				}
+			}
+			// Also precompute for ColumnOps templates
+			for _, ops := range columnOps {
+				for _, op := range ops {
+					if op.Type == "template" && op.CompiledTemplate != nil {
+						var deps []*templates.Template
+						for _, dep := range op.CompiledTemplate.Dependencies {
+							if strings.HasPrefix(dep.Name, ".ColumnVariables") {
+								deps = append(deps, dep)
+							}
+						}
+						columnVariableDeps[op.CompiledTemplate] = deps
+					}
+				}
+			}
 			rendererTableVariables, err := renderTableVariables(tableVariablesTemplates, renderedGlobalVariables)
 			if err != nil {
 				return nil, fmt.Errorf("cannot render table variables: %w", err)
 			}
 			preparedTableConfig := &PreparedTableConfig{
-				GlobalVariables:         renderedGlobalVariables,
-				TableVariables:          rendererTableVariables,
-				RowVariableTemplates:    rowVariableTemplates,
-				ColumnVariableTemplates: columnVariableTemplates,
-				ColumnTemplates:         columnTemplates,
-				ColumnOps:               columnOps,
+				GlobalVariables:               renderedGlobalVariables,
+				TableVariables:                rendererTableVariables,
+				RowVariableTemplates:          rowVariableTemplates,
+				ColumnVariableTemplates:       columnVariableTemplates,
+				ColumnVariableDepsPerTemplate: columnVariableDeps,
+				ColumnTemplates:               columnTemplates,
+				ColumnOps:                     columnOps,
 			}
 			return preparedTableConfig, nil
 		}()
