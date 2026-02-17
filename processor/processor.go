@@ -404,9 +404,8 @@ func readStatements(input io.Reader, ctx context.Context) (chan string, chan err
 	return outputCh, errCh
 }
 
-func (p Processor) processLine(ctx context.Context, line string, parser *parser.Parser, startRowIndex int) (string, error) {
+func (p Processor) processLine(ctx context.Context, line string, parser *parser.Parser, startRowIndex int, preparseResult preparsedStatement) (string, error) {
 	var tableName string
-	preparseResult := preparse(line)
 	switch v := preparseResult.(type) {
 	case nil:
 		return line, nil // passthrough: not a CREATE/INSERT
@@ -437,7 +436,8 @@ func (p Processor) processLine(ctx context.Context, line string, parser *parser.
 type lineWithOutputChannel struct {
 	line          string
 	outputChannel chan string
-	startRowIndex int // pre-computed starting row index for this statement
+	startRowIndex int                // pre-computed starting row index for this statement
+	preparsed     preparsedStatement // pre-computed statement type to avoid duplicate regex work
 }
 
 // countInsertRows quickly counts the number of value tuples in an INSERT statement
@@ -494,6 +494,7 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 				line:          line,
 				outputChannel: processedCh,
 				startRowIndex: startRowIndex,
+				preparsed:     preparsed,
 			}:
 			case <-processingCtx.Done():
 				close(processedCh)
@@ -519,7 +520,7 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 					if !ok {
 						return
 					}
-					processedLine, err := p.processLine(processingCtx, currentLine.line, stmtParser, currentLine.startRowIndex)
+					processedLine, err := p.processLine(processingCtx, currentLine.line, stmtParser, currentLine.startRowIndex, currentLine.preparsed)
 					if err != nil {
 						currentLine.outputChannel <- fmt.Sprintf("/* error: %s */\n%s", err.Error(), currentLine.line)
 						// Cancel processing context to stop all goroutines
