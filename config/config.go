@@ -7,6 +7,7 @@ import (
 
 type Config struct {
 	TableConfigs    []TableConfig       `json:"tables"`
+	SkipTables      []string            `json:"skipTables,omitempty"`
 	RowVariables    map[string]Template `json:"rowVariables,omitempty"`
 	ColumnVariables map[string]Template `json:"columnVariables,omitempty"`
 	GlobalVariables map[string]Template `json:"globalVariables,omitempty"`
@@ -50,19 +51,58 @@ type ColumnTransformation interface {
 	GetType() string
 }
 
+type jsonFieldRaw struct {
+	Path     string `json:"path"`
+	Template string `json:"template"`
+}
+
+type optionsRaw struct {
+	Template string         `json:"template"`
+	Fields   []jsonFieldRaw `json:"fields"`
+}
+
+type transformationRaw struct {
+	Type       string         `json:"type"`
+	Template   string         `json:"template"` // flat format: {"template": "..."}
+	JsonFields []jsonFieldRaw `json:"json"`     // flat format: {"json": [{...}]}
+	Options    optionsRaw     `json:"options"`  // nested format: {"type": "...", "options": {...}}
+}
+
+// normalizeTransformation canonicalizes flat-format fields into the nested
+// options form so downstream code only deals with one representation.
+func normalizeTransformation(t transformationRaw) (transformationRaw, error) {
+	// Resolve template: flat → options
+	if t.Template != "" && t.Options.Template != "" {
+		return t, fmt.Errorf("ambiguous transformation: both template and options.template set")
+	}
+	if t.Template != "" {
+		t.Options.Template = t.Template
+		t.Template = ""
+	}
+
+	// Resolve json fields: flat → options
+	if len(t.JsonFields) > 0 && len(t.Options.Fields) > 0 {
+		return t, fmt.Errorf("ambiguous transformation: both json and options.fields set")
+	}
+	if len(t.JsonFields) > 0 {
+		t.Options.Fields = t.JsonFields
+		t.JsonFields = nil
+	}
+
+	// Infer type from populated fields when not explicit
+	if t.Type == "" {
+		switch {
+		case len(t.Options.Fields) > 0:
+			t.Type = "json"
+		default:
+			t.Type = "template"
+		}
+	}
+
+	return t, nil
+}
+
 func (c *ColumnConfig) UnmarshalJSON(bytes []byte) error {
-	type jsonFieldRaw struct {
-		Path     string `json:"path"`
-		Template string `json:"template"`
-	}
-	type optionsRaw struct {
-		Template string         `json:"template"`
-		Fields   []jsonFieldRaw `json:"fields"`
-	}
-	type transformationRaw struct {
-		Type    string     `json:"type"`
-		Options optionsRaw `json:"options"`
-	}
 	type columnRaw struct {
 		Name            string              `json:"name"`
 		Transformations []transformationRaw `json:"transformations"`
@@ -78,12 +118,12 @@ func (c *ColumnConfig) UnmarshalJSON(bytes []byte) error {
 	c.Templates = nil
 
 	for i, t := range raw.Transformations {
-		opType := t.Type
-		if opType == "" {
-			opType = "template"
+		t, err := normalizeTransformation(t)
+		if err != nil {
+			return fmt.Errorf("column %q, transformation %d: %w", raw.Name, i, err)
 		}
 
-		switch opType {
+		switch t.Type {
 		case "template":
 			c.Operations[i] = ColumnOperation{
 				Type:     "template",
@@ -103,7 +143,7 @@ func (c *ColumnConfig) UnmarshalJSON(bytes []byte) error {
 				JsonFields: fields,
 			}
 		default:
-			return fmt.Errorf("unknown transformation type: %s", opType)
+			return fmt.Errorf("column %q, transformation %d: unknown type: %s", raw.Name, i, t.Type)
 		}
 	}
 

@@ -737,6 +737,323 @@ func TestProcessor_JsonTransform_FromJSONConfig(t *testing.T) {
 	}
 }
 
+func TestProcessor_SkipTables_Shorthand(t *testing.T) {
+	cfg := config.Config{
+		SkipTables: []string{"audit_log"},
+	}
+
+	input := loadFixture(t, "audit_log.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if !strings.Contains(output, "CREATE TABLE") {
+		t.Error("CREATE TABLE should be preserved")
+	}
+	lowered := strings.ToLower(output)
+	if strings.Contains(lowered, "insert into") {
+		t.Error("INSERT should be dropped for tables in SkipTables")
+	}
+}
+
+func TestProcessor_SkipTables_MergesWithExistingTableConfig(t *testing.T) {
+	cfg := config.Config{
+		SkipTables: []string{"users"},
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "users",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "email",
+						Templates:  []config.Template{"anon@test.com"},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "users.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	lowered := strings.ToLower(output)
+	// Skip takes precedence — INSERT should be dropped entirely, not transformed
+	if strings.Contains(lowered, "insert into") {
+		t.Error("INSERT should be dropped when SkipTables overrides TableConfig")
+	}
+	if strings.Contains(output, "anon@test.com") {
+		t.Error("Transformations should not be applied when skip takes precedence")
+	}
+}
+
+func TestProcessor_ProcessedTables_EmptyInput(t *testing.T) {
+	cfg := config.Config{}
+	processor, err := NewProcessor(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	input := strings.NewReader("")
+	err = processor.Process(input, &bytes.Buffer{}, context.Background())
+	if err != nil {
+		t.Fatalf("Failed to process: %v", err)
+	}
+
+	tables := processor.ProcessedTables()
+	if len(tables) != 0 {
+		t.Errorf("Expected empty table list, got %v", tables)
+	}
+}
+
+func TestProcessor_ProcessedTables_SingleTable(t *testing.T) {
+	cfg := config.Config{}
+	processor, err := NewProcessor(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	input := strings.NewReader(loadFixture(t, "users.sql"))
+	err = processor.Process(input, &bytes.Buffer{}, context.Background())
+	if err != nil {
+		t.Fatalf("Failed to process: %v", err)
+	}
+
+	tables := processor.ProcessedTables()
+	if len(tables) != 1 {
+		t.Fatalf("Expected 1 table, got %d: %v", len(tables), tables)
+	}
+	if tables[0] != "users" {
+		t.Errorf("Expected 'users', got '%s'", tables[0])
+	}
+}
+
+func TestProcessor_ProcessedTables_MultipleTables_Sorted(t *testing.T) {
+	cfg := config.Config{}
+	processor, err := NewProcessor(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	fixture := loadFixture(t, "users.sql") + loadFixture(t, "orders.sql")
+	input := strings.NewReader(fixture)
+	err = processor.Process(input, &bytes.Buffer{}, context.Background())
+	if err != nil {
+		t.Fatalf("Failed to process: %v", err)
+	}
+
+	tables := processor.ProcessedTables()
+	if len(tables) != 2 {
+		t.Fatalf("Expected 2 tables, got %d: %v", len(tables), tables)
+	}
+	if tables[0] != "orders" || tables[1] != "users" {
+		t.Errorf("Expected [orders, users], got %v", tables)
+	}
+}
+
+func TestProcessor_ProcessedTables_SkippedTablesStillAppear(t *testing.T) {
+	cfg := config.Config{
+		SkipTables: []string{"audit_log"},
+	}
+	processor, err := NewProcessor(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	fixture := loadFixture(t, "audit_log.sql") + loadFixture(t, "users.sql")
+	input := strings.NewReader(fixture)
+	err = processor.Process(input, &bytes.Buffer{}, context.Background())
+	if err != nil {
+		t.Fatalf("Failed to process: %v", err)
+	}
+
+	tables := processor.ProcessedTables()
+	if len(tables) != 2 {
+		t.Fatalf("Expected 2 tables, got %d: %v", len(tables), tables)
+	}
+	found := map[string]bool{}
+	for _, name := range tables {
+		found[name] = true
+	}
+	if !found["audit_log"] {
+		t.Error("Skipped table 'audit_log' should still appear in ProcessedTables")
+	}
+	if !found["users"] {
+		t.Error("Table 'users' should appear in ProcessedTables")
+	}
+}
+
+func TestProcessor_ProcessedTables_BeforeProcess(t *testing.T) {
+	cfg := config.Config{}
+	processor, err := NewProcessor(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	tables := processor.ProcessedTables()
+	if len(tables) != 0 {
+		t.Errorf("Expected empty list before Process(), got %v", tables)
+	}
+}
+
+func TestProcessor_ProcessedTables_ReturnsNewSlice(t *testing.T) {
+	cfg := config.Config{}
+	processor, err := NewProcessor(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	input := strings.NewReader(loadFixture(t, "users.sql"))
+	err = processor.Process(input, &bytes.Buffer{}, context.Background())
+	if err != nil {
+		t.Fatalf("Failed to process: %v", err)
+	}
+
+	tables1 := processor.ProcessedTables()
+	tables2 := processor.ProcessedTables()
+	if len(tables1) > 0 {
+		tables1[0] = "MUTATED"
+	}
+	if len(tables2) > 0 && tables2[0] == "MUTATED" {
+		t.Error("ProcessedTables should return a new slice each call")
+	}
+}
+
+func TestProcessor_ProcessedTables_ResetsOnSecondProcess(t *testing.T) {
+	cfg := config.Config{}
+	processor, err := NewProcessor(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	// First Process call with users.sql
+	input1 := strings.NewReader(loadFixture(t, "users.sql"))
+	err = processor.Process(input1, &bytes.Buffer{}, context.Background())
+	if err != nil {
+		t.Fatalf("First Process failed: %v", err)
+	}
+	tables1 := processor.ProcessedTables()
+	if len(tables1) != 1 || tables1[0] != "users" {
+		t.Fatalf("Expected [users] after first Process, got %v", tables1)
+	}
+
+	// Second Process call with orders.sql
+	input2 := strings.NewReader(loadFixture(t, "orders.sql"))
+	err = processor.Process(input2, &bytes.Buffer{}, context.Background())
+	if err != nil {
+		t.Fatalf("Second Process failed: %v", err)
+	}
+	tables2 := processor.ProcessedTables()
+	if len(tables2) != 1 || tables2[0] != "orders" {
+		t.Errorf("Expected [orders] after second Process (reset), got %v", tables2)
+	}
+}
+
+func TestProcessor_SkipTable_WithColumnConfigs_SkipTakesPrecedence(t *testing.T) {
+	cfg := config.Config{
+		SkipTables: []string{"audit_log"},
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "audit_log",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "details",
+						Templates:  []config.Template{"REDACTED"},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "audit_log.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	lowered := strings.ToLower(output)
+	if strings.Contains(lowered, "insert into") {
+		t.Error("INSERT should be dropped even when column configs exist (skip takes precedence)")
+	}
+	if strings.Contains(output, "REDACTED") {
+		t.Error("Column transformations should not run when skip is true")
+	}
+	if !strings.Contains(output, "CREATE TABLE") {
+		t.Error("CREATE TABLE should be preserved")
+	}
+}
+
+func TestProcessor_SkipTable_Mixed_SkipAndTransformAndPassthrough(t *testing.T) {
+	cfg := config.Config{
+		SkipTables: []string{"audit_log"},
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "users",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "email",
+						Templates:  []config.Template{"anon@test.com"},
+					},
+				},
+			},
+		},
+	}
+
+	// audit_log = skipped, users = transformed, orders = passthrough
+	input := loadFixture(t, "audit_log.sql") + loadFixture(t, "users.sql") + loadFixture(t, "orders.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	// audit_log: CREATE preserved, INSERT dropped
+	if !strings.Contains(output, "CREATE TABLE `audit_log`") {
+		t.Error("audit_log CREATE TABLE should be preserved")
+	}
+	lowered := strings.ToLower(output)
+	if strings.Contains(lowered, "'login'") {
+		t.Error("audit_log INSERT data should be dropped")
+	}
+
+	// users: transformed
+	if !strings.Contains(output, "anon@test.com") {
+		t.Error("users email should be anonymized")
+	}
+	if strings.Contains(output, "john.doe@example.com") {
+		t.Error("Original email should not be present")
+	}
+
+	// orders: passthrough
+	if !strings.Contains(output, "99.99") {
+		t.Error("orders should pass through unchanged")
+	}
+}
+
+func TestProcessor_SkipTable_MultiValueInsert(t *testing.T) {
+	cfg := config.Config{
+		SkipTables: []string{"items"},
+	}
+
+	input := loadFixture(t, "items.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if !strings.Contains(output, "CREATE TABLE") {
+		t.Error("CREATE TABLE should be preserved")
+	}
+	lowered := strings.ToLower(output)
+	if strings.Contains(lowered, "insert into") {
+		t.Error("Multi-value INSERT should be dropped entirely")
+	}
+	if strings.Contains(output, "Item One") {
+		t.Error("INSERT data should not be present")
+	}
+}
+
 // Benchmark configuration for anonymizing benchmark_users table
 func benchmarkConfig() config.Config {
 	return config.Config{

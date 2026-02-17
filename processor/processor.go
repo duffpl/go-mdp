@@ -8,6 +8,7 @@ import (
 	"io"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +46,7 @@ type Processor struct {
 	schemaMapLock        *sync.Mutex
 	tableSchemas         map[string]TableSchema
 	schemaReadyCond      *sync.Cond // condition variable to wait for schema
+	processedTables      []string
 }
 
 func NewProcessorWithConfig(configData config.Config) (*Processor, error) {
@@ -55,6 +57,14 @@ func NewProcessor(config config.Config) (*Processor, error) {
 	tableTransformations, err := prepareTableConfigs(config)
 	if err != nil {
 		return nil, fmt.Errorf("unable to prepare transformations: %w", err)
+	}
+	// Expand SkipTables shorthand into tableTransformations
+	for _, tableName := range config.SkipTables {
+		if existing, ok := tableTransformations[tableName]; ok {
+			existing.Skip = true
+		} else {
+			tableTransformations[tableName] = &PreparedTableConfig{Skip: true}
+		}
 	}
 	schemaLock := &sync.Mutex{}
 	p := &Processor{
@@ -70,6 +80,16 @@ func NewProcessor(config config.Config) (*Processor, error) {
 	}
 	p.globalVariables = globalVariables
 	return p, nil
+}
+
+// ProcessedTables returns a sorted list of all table names encountered in
+// CREATE TABLE statements during the most recent Process() call.
+// Must be called after Process() returns.
+func (p *Processor) ProcessedTables() []string {
+	result := make([]string, len(p.processedTables))
+	copy(result, p.processedTables)
+	sort.Strings(result)
+	return result
 }
 
 func (p *Processor) processCreateTableStatement(stmt *ast.CreateTableStmt) {
@@ -404,7 +424,7 @@ func readStatements(input io.Reader, ctx context.Context) (chan string, chan err
 	return outputCh, errCh
 }
 
-func (p Processor) processLine(ctx context.Context, line string, parser *parser.Parser, startRowIndex int, preparseResult preparsedStatement) (string, error) {
+func (p *Processor) processLine(ctx context.Context, line string, parser *parser.Parser, startRowIndex int, preparseResult preparsedStatement) (string, error) {
 	var tableName string
 	switch v := preparseResult.(type) {
 	case nil:
@@ -412,9 +432,22 @@ func (p Processor) processLine(ctx context.Context, line string, parser *parser.
 	case preparsedStatementWithTable:
 		tableName = v.GetTableName()
 	}
+	// Track all CREATE TABLE names at preparse level (before config lookup — works with empty configs)
+	if _, isCreate := preparseResult.(preparsedCreateStmt); isCreate {
+		p.schemaMapLock.Lock()
+		p.processedTables = append(p.processedTables, tableName)
+		p.schemaMapLock.Unlock()
+	}
+
 	tableTransformations, ok := p.tableTransformations[tableName]
 	if !ok {
 		return line, nil // passthrough: table not configured
+	}
+	// Skip INSERT statements for tables with Skip=true (before AST parsing for performance)
+	if tableTransformations.Skip {
+		if _, isInsert := preparseResult.(preparsedInsertStmt); isInsert {
+			return "", nil
+		}
 	}
 	parseResult, _, err := parser.Parse(line, mysql.UTF8Charset, mysql.UTF8Charset)
 	if err != nil {
@@ -449,7 +482,7 @@ func countInsertRows(line string) int {
 	return len(matches) + 1 // +1 for the first tuple
 }
 
-func (p Processor) processLines(input chan string, ctx context.Context) (chan chan string, chan error) {
+func (p *Processor) processLines(input chan string, ctx context.Context) (chan chan string, chan error) {
 	outputCh := make(chan chan string, 100)
 	errCh := make(chan error, 1) // buffered to ensure error is never dropped
 	linesForProcessing := make(chan lineWithOutputChannel, 100)
@@ -556,7 +589,8 @@ var restoreFlags = format.RestoreStringSingleQuotes |
 	format.RestoreNameBackQuotes |
 	format.RestoreStringEscapeBackslash
 
-func (p Processor) Process(input io.Reader, output io.Writer, pCtx context.Context) (err error) {
+func (p *Processor) Process(input io.Reader, output io.Writer, pCtx context.Context) (err error) {
+	p.processedTables = nil // reset for this call
 	readLines, inputErrors := readStatements(input, pCtx)
 	processedLinesChans, processingErrors := p.processLines(readLines, pCtx)
 	done := make(chan error, 1)
@@ -615,6 +649,7 @@ type PreparedColumnOp struct {
 }
 
 type PreparedTableConfig struct {
+	Skip                          bool
 	ColumnOps                     map[string][]PreparedColumnOp
 	ColumnTemplates               map[string][]*templates.Template
 	ColumnVariableTemplates       map[string]*templates.Template
