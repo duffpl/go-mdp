@@ -27,7 +27,6 @@ type TableSchema struct {
 	Name    string
 }
 
-
 type statementType string
 
 const statementTypeInsert statementType = "insert"

@@ -26,8 +26,8 @@ import (
 type Processor struct {
 	Config               config.Config
 	tableTransformations map[string]*PreparedTableConfig
-	globalVariables map[string]string
-	schemaMapLock   *sync.Mutex
+	globalVariables      map[string]string
+	schemaMapLock        *sync.Mutex
 	tableSchemas         map[string]TableSchema
 	schemaReadyCond      *sync.Cond // condition variable to wait for schema
 }
@@ -35,7 +35,6 @@ type Processor struct {
 func NewProcessorWithConfig(configData config.Config) (*Processor, error) {
 	return NewProcessor(configData)
 }
-
 
 func NewProcessor(config config.Config) (*Processor, error) {
 	tableTransformations, err := prepareTableConfigs(config)
@@ -537,7 +536,6 @@ var restoreFlags = format.RestoreStringSingleQuotes |
 	format.RestoreNameBackQuotes |
 	format.RestoreStringEscapeBackslash
 
-
 func (p Processor) Process(input io.Reader, output io.Writer, pCtx context.Context) (err error) {
 	readLines, inputErrors := readStatements(input, pCtx)
 	processedLinesChans, processingErrors := p.processLines(readLines, pCtx)
@@ -590,11 +588,10 @@ func (p Processor) Process(input io.Reader, output io.Writer, pCtx context.Conte
 	}
 }
 
-
 type PreparedColumnOp struct {
-	Type             string             // "template" or "json"
+	Type             string              // "template" or "json"
 	CompiledTemplate *templates.Template // for type "template"
-	JsonFields       []jsonFieldOp      // for type "json"
+	JsonFields       []jsonFieldOp       // for type "json"
 }
 
 type PreparedTableConfig struct {
@@ -638,9 +635,9 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 			columnOps := make(map[string][]PreparedColumnOp)
 			// Track which template indices map to which operation for later assembly
 			type templateOpMapping struct {
-				colName  string
-				opIndex  int
-				tmplIdx  int
+				colName string
+				opIndex int
+				tmplIdx int
 			}
 			var templateOpMappings []templateOpMapping
 			for _, columnConfig := range tableConfig.Columns {
