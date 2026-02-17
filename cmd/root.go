@@ -51,10 +51,12 @@ to quickly create a Cobra application.`,
 		if err != nil {
 			return fmt.Errorf("cannot create input stream: %w", err)
 		}
+		defer input.Close()
 		output, err := getOutputStream(cmd.Flag(FlagNameOutput).Value.String())
 		if err != nil {
 			return fmt.Errorf("cannot create output stream: %w", err)
 		}
+		defer output.Close()
 		p, err := initProcessor(cmd)
 		if err != nil {
 			return fmt.Errorf("cannot create processor: %w", err)
@@ -115,18 +117,35 @@ func initProcessor(cmd *cobra.Command) (*processor.Processor, error) {
 	return p, nil
 }
 
-func getInputStream(filename string) (io.Reader, error) {
+func getInputStream(filename string) (io.ReadCloser, error) {
 	if filename == "" {
-		return os.Stdin, nil
+		return io.NopCloser(os.Stdin), nil
 	}
 	f, err := os.Open(filename)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open file: %w", err)
 	}
-	return bufio.NewReader(f), nil
+	return f, nil
 }
 
-func getOutputStream(filename string) (io.Writer, error) {
+type bufferedWriteCloser struct {
+	w *bufio.Writer
+	f *os.File
+}
+
+func (bwc *bufferedWriteCloser) Write(p []byte) (int, error) {
+	return bwc.w.Write(p)
+}
+
+func (bwc *bufferedWriteCloser) Close() error {
+	if err := bwc.w.Flush(); err != nil {
+		bwc.f.Close()
+		return err
+	}
+	return bwc.f.Close()
+}
+
+func getOutputStream(filename string) (io.WriteCloser, error) {
 	if filename == "" {
 		return os.Stdout, nil
 	}
@@ -134,7 +153,7 @@ func getOutputStream(filename string) (io.Writer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot create file: %w", err)
 	}
-	return bufio.NewWriter(f), nil
+	return &bufferedWriteCloser{w: bufio.NewWriter(f), f: f}, nil
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
