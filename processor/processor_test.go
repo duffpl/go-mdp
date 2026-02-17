@@ -946,6 +946,109 @@ func TestProcessor_ProcessedTables_ReturnsNewSlice(t *testing.T) {
 	}
 }
 
+func TestProcessor_SkipTable_WithColumnConfigs_SkipTakesPrecedence(t *testing.T) {
+	cfg := config.Config{
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "audit_log",
+				Skip:      true,
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "details",
+						Templates:  []config.Template{"REDACTED"},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "audit_log.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	lowered := strings.ToLower(output)
+	if strings.Contains(lowered, "insert into") {
+		t.Error("INSERT should be dropped even when column configs exist (skip takes precedence)")
+	}
+	if strings.Contains(output, "REDACTED") {
+		t.Error("Column transformations should not run when skip is true")
+	}
+	if !strings.Contains(output, "CREATE TABLE") {
+		t.Error("CREATE TABLE should be preserved")
+	}
+}
+
+func TestProcessor_SkipTable_Mixed_SkipAndTransformAndPassthrough(t *testing.T) {
+	cfg := config.Config{
+		SkipTables: []string{"audit_log"},
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "users",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "email",
+						Templates:  []config.Template{"anon@test.com"},
+					},
+				},
+			},
+		},
+	}
+
+	// audit_log = skipped, users = transformed, orders = passthrough
+	input := loadFixture(t, "audit_log.sql") + loadFixture(t, "users.sql") + loadFixture(t, "orders.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	// audit_log: CREATE preserved, INSERT dropped
+	if !strings.Contains(output, "CREATE TABLE `audit_log`") {
+		t.Error("audit_log CREATE TABLE should be preserved")
+	}
+	lowered := strings.ToLower(output)
+	if strings.Contains(lowered, "'login'") {
+		t.Error("audit_log INSERT data should be dropped")
+	}
+
+	// users: transformed
+	if !strings.Contains(output, "anon@test.com") {
+		t.Error("users email should be anonymized")
+	}
+	if strings.Contains(output, "john.doe@example.com") {
+		t.Error("Original email should not be present")
+	}
+
+	// orders: passthrough
+	if !strings.Contains(output, "99.99") {
+		t.Error("orders should pass through unchanged")
+	}
+}
+
+func TestProcessor_SkipTable_MultiValueInsert(t *testing.T) {
+	cfg := config.Config{
+		SkipTables: []string{"items"},
+	}
+
+	input := loadFixture(t, "items.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if !strings.Contains(output, "CREATE TABLE") {
+		t.Error("CREATE TABLE should be preserved")
+	}
+	lowered := strings.ToLower(output)
+	if strings.Contains(lowered, "insert into") {
+		t.Error("Multi-value INSERT should be dropped entirely")
+	}
+	if strings.Contains(output, "Item One") {
+		t.Error("INSERT data should not be present")
+	}
+}
+
 // Benchmark configuration for anonymizing benchmark_users table
 func benchmarkConfig() config.Config {
 	return config.Config{
