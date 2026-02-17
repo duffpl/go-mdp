@@ -64,7 +64,7 @@ func (c *ColumnConfig) UnmarshalJSON(bytes []byte) error {
 		Options optionsRaw `json:"options"`
 	}
 	type columnRaw struct {
-		Name            string             `json:"name"`
+		Name            string              `json:"name"`
 		Transformations []transformationRaw `json:"transformations"`
 	}
 

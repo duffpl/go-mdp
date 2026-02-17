@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,15 +21,12 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/format"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
-	"github.com/sirupsen/logrus"
 )
 
 type Processor struct {
 	Config               config.Config
 	tableTransformations map[string]*PreparedTableConfig
 	globalVariables      map[string]string
-	tableRowCounterMutex *sync.Mutex
-	tableRowCounterMap   map[string]int
 	schemaMapLock        *sync.Mutex
 	tableSchemas         map[string]TableSchema
 	schemaReadyCond      *sync.Cond // condition variable to wait for schema
@@ -36,15 +34,6 @@ type Processor struct {
 
 func NewProcessorWithConfig(configData config.Config) (*Processor, error) {
 	return NewProcessor(configData)
-}
-
-func (p *Processor) incrementTableCounter(tableName string) int {
-	p.tableRowCounterMutex.Lock()
-	defer p.tableRowCounterMutex.Unlock()
-	counter := p.tableRowCounterMap[tableName]
-	counter++
-	p.tableRowCounterMap[tableName] = counter
-	return counter
 }
 
 func NewProcessor(config config.Config) (*Processor, error) {
@@ -56,13 +45,11 @@ func NewProcessor(config config.Config) (*Processor, error) {
 	p := &Processor{
 		Config:               config,
 		tableTransformations: tableTransformations,
-		tableRowCounterMutex: &sync.Mutex{},
-		tableRowCounterMap:   make(map[string]int),
 		tableSchemas:         make(map[string]TableSchema),
 		schemaMapLock:        schemaLock,
 		schemaReadyCond:      sync.NewCond(schemaLock),
 	}
-	globalVariables, err := p.renderGlobalVariables()
+	globalVariables, err := renderGlobalVariables(config)
 	if err != nil {
 		return nil, fmt.Errorf("cannot render global variables: %w", err)
 	}
@@ -90,15 +77,28 @@ func (p *Processor) processCreateTableStatement(stmt *ast.CreateTableStmt) {
 	p.schemaMapLock.Unlock()
 }
 
-// waitForSchema blocks until the schema for tableName is available
-func (p *Processor) waitForSchema(tableName string) TableSchema {
+// waitForSchema blocks until the schema for tableName is available or context is cancelled
+func (p *Processor) waitForSchema(ctx context.Context, tableName string) (TableSchema, error) {
 	p.schemaMapLock.Lock()
 	defer p.schemaMapLock.Unlock()
 	for {
 		if schema, ok := p.tableSchemas[tableName]; ok {
-			return schema
+			return schema, nil
 		}
-		p.schemaReadyCond.Wait() // releases lock, waits for signal, re-acquires lock
+		if ctx.Err() != nil {
+			return TableSchema{}, fmt.Errorf("context cancelled while waiting for schema of table %s: %w", tableName, ctx.Err())
+		}
+		// Wake up when context is cancelled so we don't block forever
+		done := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				p.schemaReadyCond.Broadcast()
+			case <-done:
+			}
+		}()
+		p.schemaReadyCond.Wait()
+		close(done)
 	}
 }
 
@@ -129,10 +129,13 @@ func mapInsertRowToColumns(insertRow []ast.ExprNode, tableSchema TableSchema) (t
 	return result, nil
 }
 
-func (p *Processor) processInsertStatement(stmt *ast.InsertStmt, tableConfig *PreparedTableConfig, startRowIndex int) (string, error) {
+func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.InsertStmt, tableConfig *PreparedTableConfig, startRowIndex int) (string, error) {
 	tableName := stmt.Table.TableRefs.Left.(*ast.TableSource).Source.(*ast.TableName).Name.String()
 	// Wait for schema to be available (CREATE TABLE must be processed first)
-	schema := p.waitForSchema(tableName)
+	schema, err := p.waitForSchema(ctx, tableName)
+	if err != nil {
+		return "", err
+	}
 	allInsertRows := stmt.Lists
 	for currentRowIndex := range allInsertRows {
 		// Use pre-computed row index (no lock needed)
@@ -162,7 +165,7 @@ func (p *Processor) processInsertStatement(stmt *ast.InsertStmt, tableConfig *Pr
 		}
 
 		for columnIdx := range currentRow {
-			columnSchema, _ := schema.Columns[columnIdx]
+			columnSchema := schema.Columns[columnIdx]
 
 			// Check if we have ColumnOps (new path)
 			if columnOps, ok := tableConfig.ColumnOps[columnSchema.Name]; ok {
@@ -237,7 +240,7 @@ func (p *Processor) processInsertStatement(stmt *ast.InsertStmt, tableConfig *Pr
 		}
 	}
 	buf := new(bytes.Buffer)
-	err := stmt.Restore(format.NewRestoreCtx(restoreFlags, buf))
+	err = stmt.Restore(format.NewRestoreCtx(restoreFlags, buf))
 	if err != nil {
 		return "", fmt.Errorf("cannot restore insert statement: %w", err)
 	}
@@ -311,8 +314,8 @@ func (p preparsedInsertStmt) GetType() string {
 }
 
 var preparseRegexps = map[statementType]*regexp.Regexp{
-	statementTypeInsert:      regexp.MustCompile(`(?m)^(?:\/\*!\d+ )?INSERT(?: (?:LOWPRIORITY|DELAYED|HIGH_PRIORITY))?(?: IGNORE)? INTO \x60?(\w+)\x60?`),
-	statementTypeCreateTable: regexp.MustCompile(`(?m)^(?:\/\*!\d+ )?CREATE(?: TEMPORARY)? TABLE(?: IF NOT EXISTS)? \x60?(\w+)\x60?`),
+	statementTypeInsert:      regexp.MustCompile(`(?mi)^(?:\/\*!\d+ )?INSERT(?: (?:LOWPRIORITY|DELAYED|HIGH_PRIORITY))?(?: IGNORE)? INTO \x60?(\w+)\x60?`),
+	statementTypeCreateTable: regexp.MustCompile(`(?mi)^(?:\/\*!\d+ )?CREATE(?: TEMPORARY)? TABLE(?: IF NOT EXISTS)? \x60?(\w+)\x60?`),
 }
 
 func preparse(line string) preparsedStatement {
@@ -347,14 +350,16 @@ func readStatements(input io.Reader, ctx context.Context) (chan string, chan err
 			default:
 			}
 			line, err := bufferedInput.ReadString('\n')
-			if err == io.EOF {
-				return
-			} else if err != nil {
+			if err != nil && err != io.EOF {
 				errCh <- err
 				return
 			}
+			isEOF := err == io.EOF
 			line = strings.TrimSpace(line)
 			if len(line) == 0 {
+				if isEOF {
+					return
+				}
 				outputCh <- line
 				continue
 			}
@@ -363,27 +368,31 @@ func readStatements(input io.Reader, ctx context.Context) (chan string, chan err
 				errCh <- err
 				return
 			}
-			//currentStatementLine += line + "\n"
 			lastCharacter := line[len(line)-1:]
 			if lastCharacter == ";" {
 				outputCh <- currentStatementLine.String()
 				currentStatementLine = strings.Builder{}
-			} else {
-				continue
+			}
+			if isEOF {
+				remaining := strings.TrimSpace(currentStatementLine.String())
+				if len(remaining) > 0 {
+					outputCh <- remaining + "\n"
+				}
+				return
 			}
 		}
 	}()
 	return outputCh, errCh
 }
 
-func (p Processor) processLine(line string, parser *parser.Parser, startRowIndex int) (string, error) {
+func (p Processor) processLine(ctx context.Context, line string, parser *parser.Parser, startRowIndex int) (string, error) {
 	var tableName string
 	preparseResult := preparse(line)
-	switch preparseResult.(type) {
+	switch v := preparseResult.(type) {
 	case nil:
 		return line, nil // passthrough: not a CREATE/INSERT
 	case preparsedStatementWithTable:
-		tableName = preparseResult.(preparsedStatementWithTable).GetTableName()
+		tableName = v.GetTableName()
 	}
 	tableTransformations, ok := p.tableTransformations[tableName]
 	if !ok {
@@ -394,14 +403,14 @@ func (p Processor) processLine(line string, parser *parser.Parser, startRowIndex
 		return line, fmt.Errorf("cannot parse statement for table %s: %w", tableName, err)
 	}
 	statement := parseResult[0]
-	switch statement.(type) {
+	switch stmt := statement.(type) {
 	case *ast.InsertStmt:
-		line, err = p.processInsertStatement(statement.(*ast.InsertStmt), tableTransformations, startRowIndex)
+		line, err = p.processInsertStatement(ctx, stmt, tableTransformations, startRowIndex)
 		if err != nil {
 			return line, fmt.Errorf("cannot process insert statement for table %s: %w", tableName, err)
 		}
 	case *ast.CreateTableStmt:
-		p.processCreateTableStatement(statement.(*ast.CreateTableStmt))
+		p.processCreateTableStatement(stmt)
 	}
 	return line, nil
 }
@@ -409,8 +418,7 @@ func (p Processor) processLine(line string, parser *parser.Parser, startRowIndex
 type lineWithOutputChannel struct {
 	line          string
 	outputChannel chan string
-	startRowIndex int    // pre-computed starting row index for this statement
-	tableName     string // table name for INSERT statements
+	startRowIndex int // pre-computed starting row index for this statement
 }
 
 // countInsertRows quickly counts the number of value tuples in an INSERT statement
@@ -426,7 +434,7 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 	outputCh := make(chan chan string, 100)
 	errCh := make(chan error, 1) // buffered to ensure error is never dropped
 	linesForProcessing := make(chan lineWithOutputChannel, 100)
-	processorCount := 8
+	processorCount := runtime.NumCPU()
 	lineProcessorsWg := sync.WaitGroup{}
 
 	// Create a cancellable context for coordinated shutdown
@@ -447,13 +455,12 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 
 			// Pre-compute row index for INSERT statements
 			var startRowIndex int
-			var tableName string
 			preparsed := preparse(line)
 			if insertStmt, ok := preparsed.(preparsedInsertStmt); ok {
-				tableName = insertStmt.GetTableName()
+				name := insertStmt.GetTableName()
 				rowCount := countInsertRows(line)
-				startRowIndex = tableRowCounters[tableName] + 1 // 1-based indexing
-				tableRowCounters[tableName] += rowCount
+				startRowIndex = tableRowCounters[name] + 1 // 1-based indexing
+				tableRowCounters[name] += rowCount
 			}
 
 			processedCh := make(chan string, 1) // buffered to prevent blocking
@@ -468,7 +475,6 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 				line:          line,
 				outputChannel: processedCh,
 				startRowIndex: startRowIndex,
-				tableName:     tableName,
 			}:
 			case <-processingCtx.Done():
 				close(processedCh)
@@ -478,11 +484,9 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 	}()
 
 	for i := 0; i < processorCount; i++ {
+		lineProcessorsWg.Add(1)
 		go func() {
-			defer func() {
-				lineProcessorsWg.Done()
-			}()
-			lineProcessorsWg.Add(1)
+			defer lineProcessorsWg.Done()
 			stmtParser := parser.New()
 			for {
 				select {
@@ -496,7 +500,7 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 					if !ok {
 						return
 					}
-					processedLine, err := p.processLine(currentLine.line, stmtParser, currentLine.startRowIndex)
+					processedLine, err := p.processLine(processingCtx, currentLine.line, stmtParser, currentLine.startRowIndex)
 					if err != nil {
 						currentLine.outputChannel <- fmt.Sprintf("/* error: %s */\n%s", err.Error(), currentLine.line)
 						// Cancel processing context to stop all goroutines
@@ -507,7 +511,10 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 							close(work.outputChannel)
 						}
 						// Now send the error - main loop can receive it
-						errCh <- err
+						select {
+						case errCh <- err:
+						default:
+						}
 						return
 					}
 					currentLine.outputChannel <- processedLine
@@ -524,15 +531,10 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 	return outputCh, errCh
 }
 
-var log logrus.FieldLogger = logrus.New()
 var restoreFlags = format.RestoreStringSingleQuotes |
 	format.RestoreKeyWordLowercase |
 	format.RestoreNameBackQuotes |
 	format.RestoreStringEscapeBackslash
-
-func SetLogger(logger logrus.FieldLogger) {
-	log = logger
-}
 
 func (p Processor) Process(input io.Reader, output io.Writer, pCtx context.Context) (err error) {
 	readLines, inputErrors := readStatements(input, pCtx)
@@ -586,36 +588,10 @@ func (p Processor) Process(input io.Reader, output io.Writer, pCtx context.Conte
 	}
 }
 
-func (p Processor) renderGlobalVariables() (map[string]string, error) {
-	compiled, err := templates.CompileTemplates(p.Config.GlobalVariables, "TableVariables")
-	if err != nil {
-		return nil, fmt.Errorf("cannot compile global variables templates: %w", err)
-	}
-	ordered, err := templates.GetOrderedTemplates(compiled)
-	if err != nil {
-		return nil, fmt.Errorf("cannot resolve global variables order: %w", err)
-	}
-	result := make(map[string]string, len(ordered))
-	for _, tmpl := range ordered {
-		output := new(bytes.Buffer)
-		err := tmpl.CompiledTemplate.Execute(output, struct {
-			GlobalVariables map[string]string
-		}{
-			GlobalVariables: result,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("cannot render global variables template '%s': %w", tmpl.Name, err)
-		}
-		shortName, _ := strings.CutPrefix(tmpl.Name, ".GlobalVariables.")
-		result[shortName] = output.String()
-	}
-	return result, nil
-}
-
 type PreparedColumnOp struct {
-	Type             string             // "template" or "json"
+	Type             string              // "template" or "json"
 	CompiledTemplate *templates.Template // for type "template"
-	JsonFields       []jsonFieldOp      // for type "json"
+	JsonFields       []jsonFieldOp       // for type "json"
 }
 
 type PreparedTableConfig struct {
@@ -659,9 +635,9 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 			columnOps := make(map[string][]PreparedColumnOp)
 			// Track which template indices map to which operation for later assembly
 			type templateOpMapping struct {
-				colName  string
-				opIndex  int
-				tmplIdx  int
+				colName string
+				opIndex int
+				tmplIdx int
 			}
 			var templateOpMappings []templateOpMapping
 			for _, columnConfig := range tableConfig.Columns {
