@@ -12,7 +12,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/bobg/go-generics/v3/slices"
 	"github.com/duffpl/go-mdp/v2/config"
 	"github.com/duffpl/go-mdp/v2/templates"
 	"github.com/duffpl/go-mdp/v2/transformations"
@@ -189,9 +188,7 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 					switch op.Type {
 					case "template":
 						currentColumn := currentRow[columnIdx]
-						columnVariablesTemplates := slices.Filter(op.CompiledTemplate.Dependencies, func(tmpl *templates.Template) bool {
-							return strings.HasPrefix(tmpl.Name, ".ColumnVariables")
-						})
+						columnVariablesTemplates := tableConfig.ColumnVariableDepsPerTemplate[op.CompiledTemplate]
 						columnData := &columnTemplateData{
 							rowTemplateData: *rowData,
 							FieldValue:      currentColumn.(ast.ValueExpr).GetString(),
@@ -237,9 +234,7 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 				if err != nil {
 					return "", fmt.Errorf("cannot get transformation function: %w", err)
 				}
-				columnVariablesTemplates := slices.Filter(tmpl.Dependencies, func(tmpl *templates.Template) bool {
-					return strings.HasPrefix(tmpl.Name, ".ColumnVariables")
-				})
+				columnVariablesTemplates := tableConfig.ColumnVariableDepsPerTemplate[tmpl]
 				columnData := &columnTemplateData{
 					rowTemplateData: *rowData,
 					FieldValue:      currentColumn.(ast.ValueExpr).GetString(),
@@ -624,12 +619,13 @@ type PreparedColumnOp struct {
 }
 
 type PreparedTableConfig struct {
-	ColumnOps               map[string][]PreparedColumnOp
-	ColumnTemplates         map[string][]*templates.Template
-	ColumnVariableTemplates map[string]*templates.Template
-	GlobalVariables         map[string]string
-	TableVariables          map[string]string
-	RowVariableTemplates    []*templates.Template
+	ColumnOps                     map[string][]PreparedColumnOp
+	ColumnTemplates               map[string][]*templates.Template
+	ColumnVariableTemplates       map[string]*templates.Template
+	ColumnVariableDepsPerTemplate map[*templates.Template][]*templates.Template
+	GlobalVariables               map[string]string
+	TableVariables                map[string]string
+	RowVariableTemplates          []*templates.Template
 }
 
 func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableConfig, error) {
@@ -748,17 +744,48 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 					ops[mapping.opIndex].CompiledTemplate = compiledTmpl
 				}
 			}
+			// Precompute column variable dependency filter per template
+			columnVariableDeps := make(map[*templates.Template][]*templates.Template)
+			for _, colTemplates := range columnTemplates {
+				for _, tmpl := range colTemplates {
+					if tmpl == nil {
+						continue
+					}
+					var deps []*templates.Template
+					for _, dep := range tmpl.Dependencies {
+						if strings.HasPrefix(dep.Name, ".ColumnVariables") {
+							deps = append(deps, dep)
+						}
+					}
+					columnVariableDeps[tmpl] = deps
+				}
+			}
+			// Also precompute for ColumnOps templates
+			for _, ops := range columnOps {
+				for _, op := range ops {
+					if op.Type == "template" && op.CompiledTemplate != nil {
+						var deps []*templates.Template
+						for _, dep := range op.CompiledTemplate.Dependencies {
+							if strings.HasPrefix(dep.Name, ".ColumnVariables") {
+								deps = append(deps, dep)
+							}
+						}
+						columnVariableDeps[op.CompiledTemplate] = deps
+					}
+				}
+			}
 			rendererTableVariables, err := renderTableVariables(tableVariablesTemplates, renderedGlobalVariables)
 			if err != nil {
 				return nil, fmt.Errorf("cannot render table variables: %w", err)
 			}
 			preparedTableConfig := &PreparedTableConfig{
-				GlobalVariables:         renderedGlobalVariables,
-				TableVariables:          rendererTableVariables,
-				RowVariableTemplates:    rowVariableTemplates,
-				ColumnVariableTemplates: columnVariableTemplates,
-				ColumnTemplates:         columnTemplates,
-				ColumnOps:               columnOps,
+				GlobalVariables:               renderedGlobalVariables,
+				TableVariables:                rendererTableVariables,
+				RowVariableTemplates:          rowVariableTemplates,
+				ColumnVariableTemplates:       columnVariableTemplates,
+				ColumnVariableDepsPerTemplate: columnVariableDeps,
+				ColumnTemplates:               columnTemplates,
+				ColumnOps:                     columnOps,
 			}
 			return preparedTableConfig, nil
 		}()
