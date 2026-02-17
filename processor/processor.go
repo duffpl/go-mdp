@@ -8,6 +8,7 @@ import (
 	"io"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ type Processor struct {
 	schemaMapLock        *sync.Mutex
 	tableSchemas         map[string]TableSchema
 	schemaReadyCond      *sync.Cond // condition variable to wait for schema
+	processedTables      []string
 }
 
 func NewProcessorWithConfig(configData config.Config) (*Processor, error) {
@@ -63,6 +65,13 @@ func NewProcessor(config config.Config) (*Processor, error) {
 	}
 	p.globalVariables = globalVariables
 	return p, nil
+}
+
+func (p *Processor) ProcessedTables() []string {
+	result := make([]string, len(p.processedTables))
+	copy(result, p.processedTables)
+	sort.Strings(result)
+	return result
 }
 
 func (p *Processor) processCreateTableStatement(stmt *ast.CreateTableStmt) {
@@ -393,7 +402,7 @@ func readStatements(input io.Reader, ctx context.Context) (chan string, chan err
 	return outputCh, errCh
 }
 
-func (p Processor) processLine(ctx context.Context, line string, parser *parser.Parser, startRowIndex int) (string, error) {
+func (p *Processor) processLine(ctx context.Context, line string, parser *parser.Parser, startRowIndex int) (string, error) {
 	var tableName string
 	preparseResult := preparse(line)
 	switch v := preparseResult.(type) {
@@ -402,6 +411,13 @@ func (p Processor) processLine(ctx context.Context, line string, parser *parser.
 	case preparsedStatementWithTable:
 		tableName = v.GetTableName()
 	}
+	// Track all CREATE TABLE names at preparse level (before config lookup — works with empty configs)
+	if _, isCreate := preparseResult.(preparsedCreateStmt); isCreate {
+		p.schemaMapLock.Lock()
+		p.processedTables = append(p.processedTables, tableName)
+		p.schemaMapLock.Unlock()
+	}
+
 	tableTransformations, ok := p.tableTransformations[tableName]
 	if !ok {
 		return line, nil // passthrough: table not configured
@@ -444,7 +460,7 @@ func countInsertRows(line string) int {
 	return len(matches) + 1 // +1 for the first tuple
 }
 
-func (p Processor) processLines(input chan string, ctx context.Context) (chan chan string, chan error) {
+func (p *Processor) processLines(input chan string, ctx context.Context) (chan chan string, chan error) {
 	outputCh := make(chan chan string, 100)
 	errCh := make(chan error, 1) // buffered to ensure error is never dropped
 	linesForProcessing := make(chan lineWithOutputChannel, 100)
@@ -550,7 +566,7 @@ var restoreFlags = format.RestoreStringSingleQuotes |
 	format.RestoreNameBackQuotes |
 	format.RestoreStringEscapeBackslash
 
-func (p Processor) Process(input io.Reader, output io.Writer, pCtx context.Context) (err error) {
+func (p *Processor) Process(input io.Reader, output io.Writer, pCtx context.Context) (err error) {
 	readLines, inputErrors := readStatements(input, pCtx)
 	processedLinesChans, processingErrors := p.processLines(readLines, pCtx)
 	done := make(chan error, 1)

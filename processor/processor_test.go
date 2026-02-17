@@ -814,6 +814,138 @@ func TestProcessor_SkipTables_MergesWithExistingTableConfig(t *testing.T) {
 	}
 }
 
+func TestProcessor_ProcessedTables_EmptyInput(t *testing.T) {
+	cfg := config.Config{}
+	processor, err := NewProcessor(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	input := strings.NewReader("")
+	err = processor.Process(input, &bytes.Buffer{}, context.Background())
+	if err != nil {
+		t.Fatalf("Failed to process: %v", err)
+	}
+
+	tables := processor.ProcessedTables()
+	if len(tables) != 0 {
+		t.Errorf("Expected empty table list, got %v", tables)
+	}
+}
+
+func TestProcessor_ProcessedTables_SingleTable(t *testing.T) {
+	cfg := config.Config{}
+	processor, err := NewProcessor(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	input := strings.NewReader(loadFixture(t, "users.sql"))
+	err = processor.Process(input, &bytes.Buffer{}, context.Background())
+	if err != nil {
+		t.Fatalf("Failed to process: %v", err)
+	}
+
+	tables := processor.ProcessedTables()
+	if len(tables) != 1 {
+		t.Fatalf("Expected 1 table, got %d: %v", len(tables), tables)
+	}
+	if tables[0] != "users" {
+		t.Errorf("Expected 'users', got '%s'", tables[0])
+	}
+}
+
+func TestProcessor_ProcessedTables_MultipleTables_Sorted(t *testing.T) {
+	cfg := config.Config{}
+	processor, err := NewProcessor(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	fixture := loadFixture(t, "users.sql") + loadFixture(t, "orders.sql")
+	input := strings.NewReader(fixture)
+	err = processor.Process(input, &bytes.Buffer{}, context.Background())
+	if err != nil {
+		t.Fatalf("Failed to process: %v", err)
+	}
+
+	tables := processor.ProcessedTables()
+	if len(tables) != 2 {
+		t.Fatalf("Expected 2 tables, got %d: %v", len(tables), tables)
+	}
+	if tables[0] != "orders" || tables[1] != "users" {
+		t.Errorf("Expected [orders, users], got %v", tables)
+	}
+}
+
+func TestProcessor_ProcessedTables_SkippedTablesStillAppear(t *testing.T) {
+	cfg := config.Config{
+		SkipTables: []string{"audit_log"},
+	}
+	processor, err := NewProcessor(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	fixture := loadFixture(t, "audit_log.sql") + loadFixture(t, "users.sql")
+	input := strings.NewReader(fixture)
+	err = processor.Process(input, &bytes.Buffer{}, context.Background())
+	if err != nil {
+		t.Fatalf("Failed to process: %v", err)
+	}
+
+	tables := processor.ProcessedTables()
+	if len(tables) != 2 {
+		t.Fatalf("Expected 2 tables, got %d: %v", len(tables), tables)
+	}
+	found := map[string]bool{}
+	for _, name := range tables {
+		found[name] = true
+	}
+	if !found["audit_log"] {
+		t.Error("Skipped table 'audit_log' should still appear in ProcessedTables")
+	}
+	if !found["users"] {
+		t.Error("Table 'users' should appear in ProcessedTables")
+	}
+}
+
+func TestProcessor_ProcessedTables_BeforeProcess(t *testing.T) {
+	cfg := config.Config{}
+	processor, err := NewProcessor(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	tables := processor.ProcessedTables()
+	if len(tables) != 0 {
+		t.Errorf("Expected empty list before Process(), got %v", tables)
+	}
+}
+
+func TestProcessor_ProcessedTables_ReturnsNewSlice(t *testing.T) {
+	cfg := config.Config{}
+	processor, err := NewProcessor(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	input := strings.NewReader(loadFixture(t, "users.sql"))
+	err = processor.Process(input, &bytes.Buffer{}, context.Background())
+	if err != nil {
+		t.Fatalf("Failed to process: %v", err)
+	}
+
+	tables1 := processor.ProcessedTables()
+	tables2 := processor.ProcessedTables()
+	if len(tables1) > 0 {
+		tables1[0] = "MUTATED"
+	}
+	if len(tables2) > 0 && tables2[0] == "MUTATED" {
+		t.Error("ProcessedTables should return a new slice each call")
+	}
+}
+
 // Benchmark configuration for anonymizing benchmark_users table
 func benchmarkConfig() config.Config {
 	return config.Config{
