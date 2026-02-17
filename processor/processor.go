@@ -131,17 +131,17 @@ type columnTemplateData struct {
 	FieldValue      interface{}
 }
 
-func mapInsertRowToColumns(insertRow []ast.ExprNode, tableSchema TableSchema) (transformations.MappedRow, error) {
-	result := make(transformations.MappedRow)
+func mapInsertRowToColumns(insertRow []ast.ExprNode, tableSchema TableSchema, result transformations.MappedRow) error {
+	clear(result)
 	for i := range insertRow {
 		field, ok := insertRow[i].(ast.ValueExpr)
 		if !ok {
-			return nil, fmt.Errorf("cannot cast column value (%T)", insertRow[i])
+			return fmt.Errorf("cannot cast column value (%T)", insertRow[i])
 		}
 		column := tableSchema.Columns[i]
 		result[column.Name] = field.GetValue()
 	}
-	return result, nil
+	return nil
 }
 
 func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.InsertStmt, tableConfig *PreparedTableConfig, startRowIndex int) (string, error) {
@@ -152,11 +152,12 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 		return "", err
 	}
 	allInsertRows := stmt.Lists
+	reusableRow := make(transformations.MappedRow, len(schema.Columns))
 	for currentRowIndex := range allInsertRows {
 		// Use pre-computed row index (no lock needed)
 		tableRowIndex := startRowIndex + currentRowIndex
 		currentRow := allInsertRows[currentRowIndex]
-		mappedRow, err := mapInsertRowToColumns(currentRow, schema)
+		err := mapInsertRowToColumns(currentRow, schema, reusableRow)
 		if err != nil {
 			return "", fmt.Errorf("cannot map row: %w", err)
 		}
@@ -164,7 +165,7 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 			Index: tableRowIndex,
 		}
 		rowData := &rowTemplateData{
-			Row:             mappedRow,
+			Row:             reusableRow,
 			RowMeta:         rowMeta,
 			RowVariables:    make(map[string]string),
 			GlobalVariables: tableConfig.GlobalVariables,
