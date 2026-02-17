@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -434,7 +435,7 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 	outputCh := make(chan chan string, 100)
 	errCh := make(chan error, 1) // buffered to ensure error is never dropped
 	linesForProcessing := make(chan lineWithOutputChannel, 100)
-	processorCount := 8
+	processorCount := runtime.NumCPU()
 	lineProcessorsWg := sync.WaitGroup{}
 
 	// Create a cancellable context for coordinated shutdown
