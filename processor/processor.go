@@ -166,7 +166,7 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 		}
 
 		for columnIdx := range currentRow {
-			columnSchema, _ := schema.Columns[columnIdx]
+			columnSchema := schema.Columns[columnIdx]
 
 			// Check if we have ColumnOps (new path)
 			if columnOps, ok := tableConfig.ColumnOps[columnSchema.Name]; ok {
@@ -389,11 +389,11 @@ func readStatements(input io.Reader, ctx context.Context) (chan string, chan err
 func (p Processor) processLine(ctx context.Context, line string, parser *parser.Parser, startRowIndex int) (string, error) {
 	var tableName string
 	preparseResult := preparse(line)
-	switch preparseResult.(type) {
+	switch v := preparseResult.(type) {
 	case nil:
 		return line, nil // passthrough: not a CREATE/INSERT
 	case preparsedStatementWithTable:
-		tableName = preparseResult.(preparsedStatementWithTable).GetTableName()
+		tableName = v.GetTableName()
 	}
 	tableTransformations, ok := p.tableTransformations[tableName]
 	if !ok {
@@ -404,14 +404,14 @@ func (p Processor) processLine(ctx context.Context, line string, parser *parser.
 		return line, fmt.Errorf("cannot parse statement for table %s: %w", tableName, err)
 	}
 	statement := parseResult[0]
-	switch statement.(type) {
+	switch stmt := statement.(type) {
 	case *ast.InsertStmt:
-		line, err = p.processInsertStatement(ctx, statement.(*ast.InsertStmt), tableTransformations, startRowIndex)
+		line, err = p.processInsertStatement(ctx, stmt, tableTransformations, startRowIndex)
 		if err != nil {
 			return line, fmt.Errorf("cannot process insert statement for table %s: %w", tableName, err)
 		}
 	case *ast.CreateTableStmt:
-		p.processCreateTableStatement(statement.(*ast.CreateTableStmt))
+		p.processCreateTableStatement(stmt)
 	}
 	return line, nil
 }
