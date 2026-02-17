@@ -115,31 +115,6 @@ func TestColumnConfig_UnmarshalJSON_DefaultType(t *testing.T) {
 	}
 }
 
-func TestTableConfig_UnmarshalJSON_SkipField(t *testing.T) {
-	input := `{
-		"tables": [
-			{"name": "audit_log", "skip": true},
-			{"name": "users", "columns": []}
-		]
-	}`
-	var cfg Config
-	if err := json.Unmarshal([]byte(input), &cfg); err != nil {
-		t.Fatalf("Unmarshal failed: %v", err)
-	}
-	if len(cfg.TableConfigs) != 2 {
-		t.Fatalf("Expected 2 table configs, got %d", len(cfg.TableConfigs))
-	}
-	if !cfg.TableConfigs[0].Skip {
-		t.Error("Expected audit_log to have Skip=true")
-	}
-	if cfg.TableConfigs[0].TableName != "audit_log" {
-		t.Errorf("Expected table name 'audit_log', got '%s'", cfg.TableConfigs[0].TableName)
-	}
-	if cfg.TableConfigs[1].Skip {
-		t.Error("Expected users to have Skip=false")
-	}
-}
-
 func TestConfig_SkipTablesField(t *testing.T) {
 	input := `{
 		"skipTables": ["cache_entries", "job_queue"]

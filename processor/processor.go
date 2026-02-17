@@ -646,9 +646,6 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 	}
 	for _, tableConfig := range configData.TableConfigs {
 		preparedTableConfig, err := func() (*PreparedTableConfig, error) {
-			if tableConfig.Skip {
-				return &PreparedTableConfig{Skip: true}, nil
-			}
 			allTemplates := make(map[string]config.Template)
 			for name, tmpl := range configData.TableVariables {
 				allTemplates[".TableVariables."+name] = tmpl
@@ -762,7 +759,6 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 				return nil, fmt.Errorf("cannot render table variables: %w", err)
 			}
 			preparedTableConfig := &PreparedTableConfig{
-				Skip:                    tableConfig.Skip,
 				GlobalVariables:         renderedGlobalVariables,
 				TableVariables:          rendererTableVariables,
 				RowVariableTemplates:    rowVariableTemplates,

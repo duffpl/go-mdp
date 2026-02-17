@@ -24,7 +24,6 @@ type Template string
 
 type TableConfig struct {
 	TableName       string              `json:"name"`
-	Skip            bool                `json:"skip,omitempty"`
 	Columns         []ColumnConfig      `json:"columns"`
 	RowVariables    map[string]Template `json:"rowVariables,omitempty"`
 	ColumnVariables map[string]Template `json:"columnVariables,omitempty"`
