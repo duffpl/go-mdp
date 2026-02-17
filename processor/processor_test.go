@@ -762,6 +762,58 @@ func TestProcessor_SkipTable_DropsInsert(t *testing.T) {
 	}
 }
 
+func TestProcessor_SkipTables_Shorthand(t *testing.T) {
+	cfg := config.Config{
+		SkipTables: []string{"audit_log"},
+	}
+
+	input := loadFixture(t, "audit_log.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	if !strings.Contains(output, "CREATE TABLE") {
+		t.Error("CREATE TABLE should be preserved")
+	}
+	lowered := strings.ToLower(output)
+	if strings.Contains(lowered, "insert into") {
+		t.Error("INSERT should be dropped for tables in SkipTables")
+	}
+}
+
+func TestProcessor_SkipTables_MergesWithExistingTableConfig(t *testing.T) {
+	cfg := config.Config{
+		SkipTables: []string{"users"},
+		TableConfigs: []config.TableConfig{
+			{
+				TableName: "users",
+				Columns: []config.ColumnConfig{
+					{
+						ColumnName: "email",
+						Templates:  []config.Template{"anon@test.com"},
+					},
+				},
+			},
+		},
+	}
+
+	input := loadFixture(t, "users.sql")
+	output, err := processSQL(t, cfg, input)
+	if err != nil {
+		t.Fatalf("Failed to process SQL: %v", err)
+	}
+
+	lowered := strings.ToLower(output)
+	// Skip takes precedence — INSERT should be dropped entirely, not transformed
+	if strings.Contains(lowered, "insert into") {
+		t.Error("INSERT should be dropped when SkipTables overrides TableConfig")
+	}
+	if strings.Contains(output, "anon@test.com") {
+		t.Error("Transformations should not be applied when skip takes precedence")
+	}
+}
+
 // Benchmark configuration for anonymizing benchmark_users table
 func benchmarkConfig() config.Config {
 	return config.Config{

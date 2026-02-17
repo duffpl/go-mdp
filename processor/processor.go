@@ -41,6 +41,14 @@ func NewProcessor(config config.Config) (*Processor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to prepare transformations: %w", err)
 	}
+	// Expand SkipTables shorthand into tableTransformations
+	for _, tableName := range config.SkipTables {
+		if existing, ok := tableTransformations[tableName]; ok {
+			existing.Skip = true
+		} else {
+			tableTransformations[tableName] = &PreparedTableConfig{Skip: true}
+		}
+	}
 	schemaLock := &sync.Mutex{}
 	p := &Processor{
 		Config:               config,
