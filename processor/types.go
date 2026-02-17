@@ -27,10 +27,6 @@ type TableSchema struct {
 	Name    string
 }
 
-type OrderedLine struct {
-	Order int
-	Line  string
-}
 
 type statementType string
 

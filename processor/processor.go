@@ -20,16 +20,13 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/format"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	_ "github.com/pingcap/tidb/pkg/parser/test_driver"
-	"github.com/sirupsen/logrus"
 )
 
 type Processor struct {
 	Config               config.Config
 	tableTransformations map[string]*PreparedTableConfig
-	globalVariables      map[string]string
-	tableRowCounterMutex *sync.Mutex
-	tableRowCounterMap   map[string]int
-	schemaMapLock        *sync.Mutex
+	globalVariables map[string]string
+	schemaMapLock   *sync.Mutex
 	tableSchemas         map[string]TableSchema
 	schemaReadyCond      *sync.Cond // condition variable to wait for schema
 }
@@ -38,14 +35,6 @@ func NewProcessorWithConfig(configData config.Config) (*Processor, error) {
 	return NewProcessor(configData)
 }
 
-func (p *Processor) incrementTableCounter(tableName string) int {
-	p.tableRowCounterMutex.Lock()
-	defer p.tableRowCounterMutex.Unlock()
-	counter := p.tableRowCounterMap[tableName]
-	counter++
-	p.tableRowCounterMap[tableName] = counter
-	return counter
-}
 
 func NewProcessor(config config.Config) (*Processor, error) {
 	tableTransformations, err := prepareTableConfigs(config)
@@ -56,8 +45,6 @@ func NewProcessor(config config.Config) (*Processor, error) {
 	p := &Processor{
 		Config:               config,
 		tableTransformations: tableTransformations,
-		tableRowCounterMutex: &sync.Mutex{},
-		tableRowCounterMap:   make(map[string]int),
 		tableSchemas:         make(map[string]TableSchema),
 		schemaMapLock:        schemaLock,
 		schemaReadyCond:      sync.NewCond(schemaLock),
@@ -431,8 +418,7 @@ func (p Processor) processLine(ctx context.Context, line string, parser *parser.
 type lineWithOutputChannel struct {
 	line          string
 	outputChannel chan string
-	startRowIndex int    // pre-computed starting row index for this statement
-	tableName     string // table name for INSERT statements
+	startRowIndex int // pre-computed starting row index for this statement
 }
 
 // countInsertRows quickly counts the number of value tuples in an INSERT statement
@@ -469,13 +455,12 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 
 			// Pre-compute row index for INSERT statements
 			var startRowIndex int
-			var tableName string
 			preparsed := preparse(line)
 			if insertStmt, ok := preparsed.(preparsedInsertStmt); ok {
-				tableName = insertStmt.GetTableName()
+				name := insertStmt.GetTableName()
 				rowCount := countInsertRows(line)
-				startRowIndex = tableRowCounters[tableName] + 1 // 1-based indexing
-				tableRowCounters[tableName] += rowCount
+				startRowIndex = tableRowCounters[name] + 1 // 1-based indexing
+				tableRowCounters[name] += rowCount
 			}
 
 			processedCh := make(chan string, 1) // buffered to prevent blocking
@@ -490,7 +475,6 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 				line:          line,
 				outputChannel: processedCh,
 				startRowIndex: startRowIndex,
-				tableName:     tableName,
 			}:
 			case <-processingCtx.Done():
 				close(processedCh)
@@ -547,15 +531,11 @@ func (p Processor) processLines(input chan string, ctx context.Context) (chan ch
 	return outputCh, errCh
 }
 
-var log logrus.FieldLogger = logrus.New()
 var restoreFlags = format.RestoreStringSingleQuotes |
 	format.RestoreKeyWordLowercase |
 	format.RestoreNameBackQuotes |
 	format.RestoreStringEscapeBackslash
 
-func SetLogger(logger logrus.FieldLogger) {
-	log = logger
-}
 
 func (p Processor) Process(input io.Reader, output io.Writer, pCtx context.Context) (err error) {
 	readLines, inputErrors := readStatements(input, pCtx)

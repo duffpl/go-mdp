@@ -27,7 +27,6 @@ import (
 	"github.com/duffpl/go-mdp/v2/faker"
 	"github.com/duffpl/go-mdp/v2/processor"
 	"github.com/duffpl/go-mdp/v2/templates"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"io"
 	"os"
@@ -60,9 +59,6 @@ to quickly create a Cobra application.`,
 		if err != nil {
 			return fmt.Errorf("cannot create processor: %w", err)
 		}
-		l := logrus.New()
-		l.SetLevel(logrus.DebugLevel)
-		processor.SetLogger(l)
 		return p.Process(input, output, context.Background())
 	},
 }
