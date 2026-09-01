@@ -128,7 +128,12 @@ func (p *Processor) waitForSchema(ctx context.Context, tableName string) (TableS
 		go func() {
 			select {
 			case <-ctx.Done():
+				// Broadcast under the lock: otherwise the wakeup can fire
+				// between the waiter's ctx.Err() check and cond.Wait()
+				// registering, and the waiter sleeps through cancellation.
+				p.schemaMapLock.Lock()
 				p.schemaReadyCond.Broadcast()
+				p.schemaMapLock.Unlock()
 			case <-done:
 			}
 		}()
@@ -382,6 +387,22 @@ func readStatements(input io.Reader, ctx context.Context) (chan string, chan err
 			close(outputCh)
 			close(errCh)
 		}()
+		// Sends must abort on ctx cancellation: once downstream stops draining
+		// (error path or cancel), a bare send would block this goroutine forever.
+		send := func(line string) bool {
+			select {
+			case outputCh <- line:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+		sendErr := func(err error) {
+			select {
+			case errCh <- err:
+			case <-ctx.Done():
+			}
+		}
 		for {
 			select {
 			case <-ctx.Done():
@@ -390,7 +411,7 @@ func readStatements(input io.Reader, ctx context.Context) (chan string, chan err
 			}
 			line, err := bufferedInput.ReadString('\n')
 			if err != nil && err != io.EOF {
-				errCh <- err
+				sendErr(err)
 				return
 			}
 			isEOF := err == io.EOF
@@ -399,23 +420,27 @@ func readStatements(input io.Reader, ctx context.Context) (chan string, chan err
 				if isEOF {
 					return
 				}
-				outputCh <- line
+				if !send(line) {
+					return
+				}
 				continue
 			}
 			_, err = currentStatementLine.Write([]byte(line + "\n"))
 			if err != nil {
-				errCh <- err
+				sendErr(err)
 				return
 			}
 			lastCharacter := line[len(line)-1:]
 			if lastCharacter == ";" {
-				outputCh <- currentStatementLine.String()
+				if !send(currentStatementLine.String()) {
+					return
+				}
 				currentStatementLine = strings.Builder{}
 			}
 			if isEOF {
 				remaining := strings.TrimSpace(currentStatementLine.String())
 				if len(remaining) > 0 {
-					outputCh <- remaining + "\n"
+					send(remaining + "\n")
 				}
 				return
 			}
@@ -424,7 +449,7 @@ func readStatements(input io.Reader, ctx context.Context) (chan string, chan err
 	return outputCh, errCh
 }
 
-func (p *Processor) processLine(ctx context.Context, line string, parser *parser.Parser, startRowIndex int, preparseResult preparsedStatement) (string, error) {
+func (p *Processor) processLine(ctx context.Context, line string, parser *parser.Parser, startRowIndex int, preparseResult preparsedStatement, schemaDispatched bool) (string, error) {
 	var tableName string
 	switch v := preparseResult.(type) {
 	case nil:
@@ -449,6 +474,12 @@ func (p *Processor) processLine(ctx context.Context, line string, parser *parser
 			return "", nil
 		}
 	}
+	// Fail fast when no CREATE TABLE for this table appeared earlier in the input:
+	// the schema will never become available, and waiting for it would block a
+	// worker forever (deadlocking the pool once every worker waits).
+	if _, isInsert := preparseResult.(preparsedInsertStmt); isInsert && !schemaDispatched {
+		return line, fmt.Errorf("cannot process INSERT for table %s: no CREATE TABLE statement found earlier in the input, schema is unknown", tableName)
+	}
 	parseResult, _, err := parser.Parse(line, mysql.UTF8Charset, mysql.UTF8Charset)
 	if err != nil {
 		return line, fmt.Errorf("cannot parse statement for table %s: %w", tableName, err)
@@ -467,10 +498,11 @@ func (p *Processor) processLine(ctx context.Context, line string, parser *parser
 }
 
 type lineWithOutputChannel struct {
-	line          string
-	outputChannel chan string
-	startRowIndex int                // pre-computed starting row index for this statement
-	preparsed     preparsedStatement // pre-computed statement type to avoid duplicate regex work
+	line             string
+	outputChannel    chan string
+	startRowIndex    int                // pre-computed starting row index for this statement
+	preparsed        preparsedStatement // pre-computed statement type to avoid duplicate regex work
+	schemaDispatched bool               // for INSERTs: a CREATE TABLE for this table appeared earlier in the input
 }
 
 // countInsertRows quickly counts the number of value tuples in an INSERT statement
@@ -494,6 +526,8 @@ func (p *Processor) processLines(input chan string, ctx context.Context) (chan c
 
 	// Row counters per table - only accessed by dispatcher goroutine (no lock needed)
 	tableRowCounters := make(map[string]int)
+	// Tables whose CREATE TABLE has been dispatched - only accessed by dispatcher goroutine
+	dispatchedSchemas := make(map[string]bool)
 
 	go func() {
 		defer close(linesForProcessing)
@@ -507,9 +541,14 @@ func (p *Processor) processLines(input chan string, ctx context.Context) (chan c
 
 			// Pre-compute row index for INSERT statements
 			var startRowIndex int
+			var schemaDispatched bool
 			preparsed := preparse(line)
-			if insertStmt, ok := preparsed.(preparsedInsertStmt); ok {
-				name := insertStmt.GetTableName()
+			switch stmt := preparsed.(type) {
+			case preparsedCreateStmt:
+				dispatchedSchemas[stmt.GetTableName()] = true
+			case preparsedInsertStmt:
+				name := stmt.GetTableName()
+				schemaDispatched = dispatchedSchemas[name]
 				rowCount := countInsertRows(line)
 				startRowIndex = tableRowCounters[name] + 1 // 1-based indexing
 				tableRowCounters[name] += rowCount
@@ -524,10 +563,11 @@ func (p *Processor) processLines(input chan string, ctx context.Context) (chan c
 			}
 			select {
 			case linesForProcessing <- lineWithOutputChannel{
-				line:          line,
-				outputChannel: processedCh,
-				startRowIndex: startRowIndex,
-				preparsed:     preparsed,
+				line:             line,
+				outputChannel:    processedCh,
+				startRowIndex:    startRowIndex,
+				preparsed:        preparsed,
+				schemaDispatched: schemaDispatched,
 			}:
 			case <-processingCtx.Done():
 				close(processedCh)
@@ -553,7 +593,7 @@ func (p *Processor) processLines(input chan string, ctx context.Context) (chan c
 					if !ok {
 						return
 					}
-					processedLine, err := p.processLine(processingCtx, currentLine.line, stmtParser, currentLine.startRowIndex, currentLine.preparsed)
+					processedLine, err := p.processLine(processingCtx, currentLine.line, stmtParser, currentLine.startRowIndex, currentLine.preparsed, currentLine.schemaDispatched)
 					if err != nil {
 						currentLine.outputChannel <- fmt.Sprintf("/* error: %s */\n%s", err.Error(), currentLine.line)
 						// Cancel processing context to stop all goroutines
@@ -578,6 +618,8 @@ func (p *Processor) processLines(input chan string, ctx context.Context) (chan c
 	go func() {
 		lineProcessorsWg.Wait()
 		cancelProcessing() // Ensure context is cancelled when workers finish
+		// Close order matters: Process()'s shutdown drain blocks on errCh
+		// after observing outputCh closed, relying on errCh closing right after.
 		close(outputCh)
 		close(errCh)
 	}()
@@ -591,8 +633,13 @@ var restoreFlags = format.RestoreStringSingleQuotes |
 
 func (p *Processor) Process(input io.Reader, output io.Writer, pCtx context.Context) (err error) {
 	p.processedTables = nil // reset for this call
-	readLines, inputErrors := readStatements(input, pCtx)
-	processedLinesChans, processingErrors := p.processLines(readLines, pCtx)
+	// Process-scoped context: cancelled when Process returns for any reason,
+	// so pipeline goroutines (reader, dispatcher, workers) never stay blocked
+	// after an error path stops draining their channels.
+	ctx, cancel := context.WithCancel(pCtx)
+	defer cancel()
+	readLines, inputErrors := readStatements(input, ctx)
+	processedLinesChans, processingErrors := p.processLines(readLines, ctx)
 	done := make(chan error, 1)
 	go func() {
 		defer close(done)
@@ -603,29 +650,51 @@ func (p *Processor) Process(input io.Reader, output io.Writer, pCtx context.Cont
 				return
 			case processedLineCh, ok := <-processedLinesChans:
 				if !ok {
+					// Workers are done, but a buffered error may still be
+					// pending — without this drain the select above can race
+					// past it and report success on a failed run.
+					// processingErrors is closed right after processedLinesChans,
+					// so a blocking read returns promptly.
+					if procErr := <-processingErrors; procErr != nil {
+						done <- fmt.Errorf("processing error: %w", procErr)
+						return
+					}
+					select {
+					case inErr := <-inputErrors:
+						if inErr != nil {
+							done <- fmt.Errorf("input error: %w", inErr)
+							return
+						}
+					default:
+					}
 					return
 				}
-				processedLine, ok := <-processedLineCh
-				if !ok {
-					// Channel was closed (orphaned work), continue to check for errors
-					continue
+				var processedLine string
+				select {
+				case <-pCtx.Done():
+					done <- pCtx.Err()
+					return
+				case processedLine, ok = <-processedLineCh:
+					if !ok {
+						// Channel was closed (orphaned work), continue to check for errors
+						continue
+					}
 				}
 
 				if output != nil && pCtx.Err() == nil {
-					_, err = output.Write([]byte(processedLine))
-					if err != nil {
-						done <- fmt.Errorf("output error: %w", err)
+					if _, writeErr := output.Write([]byte(processedLine)); writeErr != nil {
+						done <- fmt.Errorf("output error: %w", writeErr)
 						return
 					}
 				}
-			case err = <-inputErrors:
-				if err != nil {
-					done <- fmt.Errorf("input error: %w", err)
+			case inErr := <-inputErrors:
+				if inErr != nil {
+					done <- fmt.Errorf("input error: %w", inErr)
 					return
 				}
-			case err = <-processingErrors:
-				if err != nil {
-					done <- fmt.Errorf("processing error: %w", err)
+			case procErr := <-processingErrors:
+				if procErr != nil {
+					done <- fmt.Errorf("processing error: %w", procErr)
 					return
 				}
 			}
