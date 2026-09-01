@@ -1,0 +1,28 @@
+skipTables:
+  - user_video_log_mig
+  - user_video_log_raw
+anonymizationSkipTables:
+  - custom_table_content_report
+  - custom_table_user_activity
+  - custom_table_user_data_report
+  - course_redirect_helper_mig
+  - edu_durations_mig
+  - educompleted_mig
+  - educompleted_plus_mig
+  - educourse_ids_mig
+  - educourse_mig
+  - educoursecat_mig
+  - members_mig
+  - user_video_log_mig
+  - coma_mig
+  - ava_admin
+  - user_video_log_raw
+mdp:
+  tables:
+    - name: certificate
+      columns:
+        - name: name
+          transformations:
+            - type: template
+              options:
+                template: "{{ md5 (substr 0 15 (.FieldValue)) }}_first"
