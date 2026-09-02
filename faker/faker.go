@@ -58,6 +58,17 @@ func getDefaultLocale() string {
 	return "default"
 }
 
+// localeData resolves the data set for locale, falling back to the default one.
+// Faker is also constructed as a plain struct literal, which skips the check in
+// NewWithLocale, and an unknown locale would otherwise index into an empty data
+// set and panic.
+func localeData(locale string) fakerData {
+	if data, ok := dataMap[locale]; ok {
+		return data
+	}
+	return dataMap[getDefaultLocale()]
+}
+
 func NewWithLocale(locale string) *Faker {
 	if _, ok := dataMap[locale]; !ok {
 		locale = getDefaultLocale()
@@ -102,7 +113,8 @@ func TransformFirstName(input string, locale string) string {
 		return ""
 	}
 	rng := initRng(input)
-	return dataMap[locale].FirstNames[rng.Intn(len(dataMap[locale].FirstNames))]
+	data := localeData(locale)
+	return data.FirstNames[rng.Intn(len(data.FirstNames))]
 }
 
 func TransformLastName(input string, locale string) string {
@@ -110,7 +122,8 @@ func TransformLastName(input string, locale string) string {
 		return ""
 	}
 	rng := initRng(input)
-	return dataMap[locale].LastNames[rng.Intn(len(dataMap[locale].LastNames))]
+	data := localeData(locale)
+	return data.LastNames[rng.Intn(len(data.LastNames))]
 }
 
 func TransformStreet(input string, locale string) string {
@@ -119,7 +132,8 @@ func TransformStreet(input string, locale string) string {
 	}
 	rng := initRng(input)
 	streetNumner := rng.Intn(1000)
-	return dataMap[locale].StreetNames[rng.Intn(len(dataMap[locale].StreetNames))] + " " + strconv.Itoa(streetNumner)
+	data := localeData(locale)
+	return data.StreetNames[rng.Intn(len(data.StreetNames))] + " " + strconv.Itoa(streetNumner)
 }
 
 func TransformCity(input string, locale string) string {
@@ -127,7 +141,8 @@ func TransformCity(input string, locale string) string {
 		return ""
 	}
 	rng := initRng(input)
-	return dataMap[locale].Cities[rng.Intn(len(dataMap[locale].Cities))]
+	data := localeData(locale)
+	return data.Cities[rng.Intn(len(data.Cities))]
 }
 
 func TransformFullName(input string, locale string) string {
@@ -147,15 +162,16 @@ func TransformCompanyName(input string, locale string) string {
 		return ""
 	}
 	rng := initRng(input)
+	data := localeData(locale)
 	companyNameParts := []string{}
-	companyNameParts = append(companyNameParts, dataMap[locale].Companies[rng.Intn(len(dataMap[locale].Companies))])
+	companyNameParts = append(companyNameParts, data.Companies[rng.Intn(len(data.Companies))])
 	// add second part?
 	if rng.Float32() < 0.5 {
-		companyNameParts = append(companyNameParts, dataMap[locale].Companies[rng.Intn(len(dataMap[locale].Companies))])
+		companyNameParts = append(companyNameParts, data.Companies[rng.Intn(len(data.Companies))])
 	}
 	// add suffix?
 	if rng.Float32() < 0.7 {
-		companyNameParts = append(companyNameParts, dataMap[locale].CompanySuffixes[rng.Intn(len(dataMap[locale].CompanySuffixes))])
+		companyNameParts = append(companyNameParts, data.CompanySuffixes[rng.Intn(len(data.CompanySuffixes))])
 	}
 	return strings.Join(companyNameParts, " ")
 }
@@ -166,7 +182,7 @@ func TransformBusinessId(input string, locale string) string {
 	}
 	rng := initRng(input)
 
-	format := dataMap[locale].BusinessIdFormat
+	format := localeData(locale).BusinessIdFormat
 
 	var result strings.Builder
 	for _, char := range format {

@@ -11,9 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/duffpl/go-mdp/v2/config"
-	"github.com/duffpl/go-mdp/v2/faker"
 	"github.com/duffpl/go-mdp/v2/processor"
-	"github.com/duffpl/go-mdp/v2/templates"
 	"github.com/spf13/cobra"
 	"io"
 	"os"
@@ -83,8 +81,6 @@ func initProcessor(cmd *cobra.Command) (*processor.Processor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot unmarshal config json data: %w", err)
 	}
-	f := faker.NewWithLocale(configObject.Settings.Locale)
-	templates.RegisterTemplateFuncs(f.FuncMap())
 	p, err := processor.NewProcessorWithConfig(*configObject)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create processor with config json data: %w", err)

@@ -8,11 +8,17 @@ import (
 	"text/template/parse"
 )
 
+// CompileTemplates compiles templates with the funcs registered with
+// RegisterTemplateFuncs. Prefer Registry.CompileTemplates.
 func CompileTemplates(templates map[string]config.Template, namePrefix string) (map[string]*Template, error) {
+	return defaultReg().CompileTemplates(templates, namePrefix)
+}
+
+func (r *Registry) CompileTemplates(templates map[string]config.Template, namePrefix string) (map[string]*Template, error) {
 	compiledTemplates := make(map[string]*Template)
 	for name, _template := range templates {
 		prefixedName := "." + namePrefix + "." + name
-		compiledTemplate, err := GetCompiledTemplate(string(_template), prefixedName)
+		compiledTemplate, err := r.GetCompiledTemplate(string(_template), prefixedName)
 		if err != nil {
 			return nil, fmt.Errorf("cannot compile template %s: %w", prefixedName, err)
 		}
@@ -36,12 +42,18 @@ func CompileTemplates(templates map[string]config.Template, namePrefix string) (
 	return compiledTemplates, nil
 }
 
+// CompileAllTemplates compiles templates with the funcs registered with
+// RegisterTemplateFuncs. Prefer Registry.CompileAllTemplates.
 func CompileAllTemplates(templates map[string]config.Template) (map[string]*Template, error) {
+	return defaultReg().CompileAllTemplates(templates)
+}
+
+func (r *Registry) CompileAllTemplates(templates map[string]config.Template) (map[string]*Template, error) {
 	compiledTemplates := make(map[string]*Template)
 	allTemplateNames := []string{}
 	for name, _template := range templates {
 		allTemplateNames = append(allTemplateNames, name)
-		compiledTemplate, err := GetCompiledTemplate(string(_template), name)
+		compiledTemplate, err := r.GetCompiledTemplate(string(_template), name)
 		if err != nil {
 			return nil, fmt.Errorf("cannot compile template %s: %w", name, err)
 		}

@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/duffpl/go-mdp/v2/config"
+	"github.com/duffpl/go-mdp/v2/faker"
 	"github.com/duffpl/go-mdp/v2/templates"
 	"github.com/duffpl/go-mdp/v2/transformations"
 	"github.com/pingcap/tidb/pkg/parser"
@@ -54,7 +55,12 @@ func NewProcessorWithConfig(configData config.Config) (*Processor, error) {
 }
 
 func NewProcessor(config config.Config) (*Processor, error) {
-	tableTransformations, err := prepareTableConfigs(config)
+	// Faker funcs are bound to the configured locale and text/template resolves
+	// them at parse time, so every processor compiles against its own registry.
+	// A process-wide cache would hand this processor the templates whichever
+	// locale ran first had already compiled.
+	registry := templates.NewRegistry(faker.NewWithLocale(config.Settings.Locale).FuncMap())
+	tableTransformations, err := prepareTableConfigs(config, registry)
 	if err != nil {
 		return nil, fmt.Errorf("unable to prepare transformations: %w", err)
 	}
@@ -74,7 +80,7 @@ func NewProcessor(config config.Config) (*Processor, error) {
 		schemaMapLock:        schemaLock,
 		schemaReadyCond:      sync.NewCond(schemaLock),
 	}
-	globalVariables, err := renderGlobalVariables(config)
+	globalVariables, err := renderGlobalVariables(config, registry)
 	if err != nil {
 		return nil, fmt.Errorf("cannot render global variables: %w", err)
 	}
@@ -728,9 +734,9 @@ type PreparedTableConfig struct {
 	RowVariableTemplates          []*templates.Template
 }
 
-func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableConfig, error) {
+func prepareTableConfigs(configData config.Config, registry *templates.Registry) (map[string]*PreparedTableConfig, error) {
 	result := make(map[string]*PreparedTableConfig)
-	renderedGlobalVariables, err := renderGlobalVariables(configData)
+	renderedGlobalVariables, err := renderGlobalVariables(configData, registry)
 	if err != nil {
 		return nil, fmt.Errorf("cannot render global variables: %w", err)
 	}
@@ -783,7 +789,7 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 						case "json":
 							jsonFields := make([]jsonFieldOp, len(op.JsonFields))
 							for j, f := range op.JsonFields {
-								compiled, err := templates.GetCompiledTemplate(string(f.Template), fmt.Sprintf("json.%s.%s", colName, f.Path))
+								compiled, err := registry.GetCompiledTemplate(string(f.Template), fmt.Sprintf("json.%s.%s", colName, f.Path))
 								if err != nil {
 									return nil, fmt.Errorf("cannot compile JSON field template for path '%s': %w", f.Path, err)
 								}
@@ -809,7 +815,7 @@ func prepareTableConfigs(configData config.Config) (map[string]*PreparedTableCon
 					columnTemplates[colName] = make([]*templates.Template, templateCount)
 				}
 			}
-			allCompiledTemplates, err := templates.CompileAllTemplates(allTemplates)
+			allCompiledTemplates, err := registry.CompileAllTemplates(allTemplates)
 			if err != nil {
 				return nil, fmt.Errorf("cannot compile all templates: %w", err)
 			}
@@ -920,8 +926,8 @@ func renderTableVariables(
 	return tableVariables, nil
 }
 
-func renderGlobalVariables(configData config.Config) (map[string]string, error) {
-	compiledGlobalTemplates, err := templates.CompileTemplates(configData.GlobalVariables, "GlobalVariables")
+func renderGlobalVariables(configData config.Config, registry *templates.Registry) (map[string]string, error) {
+	compiledGlobalTemplates, err := registry.CompileTemplates(configData.GlobalVariables, "GlobalVariables")
 	if err != nil {
 		return nil, fmt.Errorf("cannot compile global variables templates: %w", err)
 	}
