@@ -1108,7 +1108,9 @@ func BenchmarkProcessor_Small_100rows(b *testing.B) {
 		inputReader := strings.NewReader(input)
 		outputBuffer := &bytes.Buffer{}
 		ctx := context.Background()
-		_ = processor.Process(inputReader, outputBuffer, ctx)
+		if err := processor.Process(inputReader, outputBuffer, ctx); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -1125,7 +1127,9 @@ func BenchmarkProcessor_Medium_1000rows(b *testing.B) {
 		inputReader := strings.NewReader(input)
 		outputBuffer := &bytes.Buffer{}
 		ctx := context.Background()
-		_ = processor.Process(inputReader, outputBuffer, ctx)
+		if err := processor.Process(inputReader, outputBuffer, ctx); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -1142,7 +1146,9 @@ func BenchmarkProcessor_Large_10000rows(b *testing.B) {
 		inputReader := strings.NewReader(input)
 		outputBuffer := &bytes.Buffer{}
 		ctx := context.Background()
-		_ = processor.Process(inputReader, outputBuffer, ctx)
+		if err := processor.Process(inputReader, outputBuffer, ctx); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -1159,7 +1165,9 @@ func BenchmarkProcessor_XLarge_100000rows(b *testing.B) {
 		inputReader := strings.NewReader(input)
 		outputBuffer := &bytes.Buffer{}
 		ctx := context.Background()
-		_ = processor.Process(inputReader, outputBuffer, ctx)
+		if err := processor.Process(inputReader, outputBuffer, ctx); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -1176,7 +1184,9 @@ func BenchmarkProcessor_XXLarge_500000rows(b *testing.B) {
 		inputReader := strings.NewReader(input)
 		outputBuffer := &bytes.Buffer{}
 		ctx := context.Background()
-		_ = processor.Process(inputReader, outputBuffer, ctx)
+		if err := processor.Process(inputReader, outputBuffer, ctx); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -1193,7 +1203,9 @@ func BenchmarkProcessor_Huge_2000000rows(b *testing.B) {
 		inputReader := strings.NewReader(input)
 		outputBuffer := &bytes.Buffer{}
 		ctx := context.Background()
-		_ = processor.Process(inputReader, outputBuffer, ctx)
+		if err := processor.Process(inputReader, outputBuffer, ctx); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -1222,7 +1234,9 @@ func BenchmarkProcessor_MD5_Only(b *testing.B) {
 		inputReader := strings.NewReader(input)
 		outputBuffer := &bytes.Buffer{}
 		ctx := context.Background()
-		_ = processor.Process(inputReader, outputBuffer, ctx)
+		if err := processor.Process(inputReader, outputBuffer, ctx); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -1251,6 +1265,8 @@ func BenchmarkProcessor_SimpleTemplate(b *testing.B) {
 		inputReader := strings.NewReader(input)
 		outputBuffer := &bytes.Buffer{}
 		ctx := context.Background()
-		_ = processor.Process(inputReader, outputBuffer, ctx)
+		if err := processor.Process(inputReader, outputBuffer, ctx); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

@@ -190,33 +190,3 @@ func TestProcessor_NoGoroutineLeakOnContextCancel(t *testing.T) {
 	}
 	waitGoroutineBaseline(t, baseline, 5*time.Second)
 }
-
-// waitForSchema must return once its context is cancelled, even when the
-// cancellation races with entering the wait. Note: this is a probabilistic
-// stress test — it exercises the cancellation path but cannot deterministically
-// hit the missed-wakeup window between the ctx.Err() check and cond.Wait
-// registration. The real guard is broadcasting under schemaMapLock in
-// waitForSchema; do not treat this test alone as regression coverage for that.
-func TestProcessor_WaitForSchema_CancelRace(t *testing.T) {
-	processor, err := NewProcessor(config.Config{})
-	if err != nil {
-		t.Fatalf("Failed to create processor: %v", err)
-	}
-	for i := 0; i < 2000; i++ {
-		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan error, 1)
-		go func() {
-			_, err := processor.waitForSchema(ctx, "never_created")
-			done <- err
-		}()
-		cancel()
-		select {
-		case err := <-done:
-			if err == nil {
-				t.Fatal("Expected error from cancelled waitForSchema, got nil")
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("Iteration %d: waitForSchema missed the cancellation wakeup", i)
-		}
-	}
-}

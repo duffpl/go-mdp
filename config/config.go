@@ -17,7 +17,10 @@ type Config struct {
 }
 
 type Settings struct {
-	Locale string `json:"locale"`
+	Locale            string `json:"locale"`
+	Workers           int    `json:"workers,omitempty"`
+	MaxInFlightBytes  int64  `json:"maxInFlightBytes,omitempty"`
+	MaxStatementBytes int64  `json:"maxStatementBytes,omitempty"`
 }
 
 type Template string

@@ -9,12 +9,17 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+
 	"github.com/duffpl/go-mdp/v2/config"
 	"github.com/duffpl/go-mdp/v2/processor"
 	"github.com/spf13/cobra"
-	"io"
-	"os"
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -23,21 +28,11 @@ var rootCmd = &cobra.Command{
 	Short: "MySQL dump anonymizer/processor",
 	Long:  "go-mdp processes MySQL dump files and anonymizes data based on a JSON configuration.",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		input, err := getInputStream(cmd.Flag(FlagNameInput).Value.String())
-		if err != nil {
-			return fmt.Errorf("cannot create input stream: %w", err)
-		}
-		defer input.Close()
-		output, err := getOutputStream(cmd.Flag(FlagNameOutput).Value.String())
-		if err != nil {
-			return fmt.Errorf("cannot create output stream: %w", err)
-		}
-		defer output.Close()
 		p, err := initProcessor(cmd)
 		if err != nil {
 			return fmt.Errorf("cannot create processor: %w", err)
 		}
-		return p.Process(input, output, context.Background())
+		return runProcessor(cmd.Context(), p, cmd.Flag(FlagNameInput).Value.String(), cmd.Flag(FlagNameOutput).Value.String())
 	},
 }
 
@@ -61,6 +56,7 @@ func initProcessor(cmd *cobra.Command) (*processor.Processor, error) {
 			if err != nil {
 				return nil, fmt.Errorf("cannot create gzip reader: %w", err)
 			}
+			defer gr.Close()
 			configData, err = io.ReadAll(gr)
 			if err != nil {
 				return nil, fmt.Errorf("cannot read gzip data: %w", err)
@@ -90,7 +86,7 @@ func initProcessor(cmd *cobra.Command) (*processor.Processor, error) {
 
 func getInputStream(filename string) (io.ReadCloser, error) {
 	if filename == "" {
-		return io.NopCloser(os.Stdin), nil
+		return os.Stdin, nil
 	}
 	f, err := os.Open(filename)
 	if err != nil {
@@ -99,38 +95,85 @@ func getInputStream(filename string) (io.ReadCloser, error) {
 	return f, nil
 }
 
-type bufferedWriteCloser struct {
-	w *bufio.Writer
-	f *os.File
-}
-
-func (bwc *bufferedWriteCloser) Write(p []byte) (int, error) {
-	return bwc.w.Write(p)
-}
-
-func (bwc *bufferedWriteCloser) Close() error {
-	if err := bwc.w.Flush(); err != nil {
-		bwc.f.Close()
+// runProcessor owns CLI streams. Close the underlying descriptors to interrupt
+// blocked reads/writes on cancellation; never flush the buffer on a failed run.
+func runProcessor(ctx context.Context, p *processor.Processor, inputName, outputName string) error {
+	input, err := getInputStream(inputName)
+	if err != nil {
+		return fmt.Errorf("cannot create input stream: %w", err)
+	}
+	defer input.Close()
+	if outputName != "" {
+		inFile, ok := input.(*os.File)
+		if ok {
+			inInfo, inErr := inFile.Stat()
+			outInfo, outErr := os.Stat(outputName)
+			if inErr != nil {
+				return inErr
+			}
+			if outErr == nil && os.SameFile(inInfo, outInfo) {
+				return fmt.Errorf("input and output must be different files")
+			}
+		}
+	}
+	output, err := getOutputStream(outputName)
+	if err != nil {
+		return fmt.Errorf("cannot create output stream: %w", err)
+	}
+	stop := context.AfterFunc(ctx, func() { input.Close(); output.Abort() })
+	defer stop()
+	if err := p.Process(input, output, ctx); err != nil {
+		input.Close()
+		output.Abort()
 		return err
 	}
-	return bwc.f.Close()
+	if err := output.Close(); err != nil {
+		return fmt.Errorf("cannot finish output: %w", err)
+	}
+	return ctx.Err()
 }
 
-func getOutputStream(filename string) (io.WriteCloser, error) {
-	if filename == "" {
-		return os.Stdout, nil
+type bufferedWriteCloser struct {
+	mu sync.Mutex
+	w  *bufio.Writer
+	f  *os.File
+}
+
+func (b *bufferedWriteCloser) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.w.Write(p)
+}
+func (b *bufferedWriteCloser) WriteString(s string) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.w.WriteString(s)
+}
+func (b *bufferedWriteCloser) Abort() { _ = b.f.Close() }
+func (b *bufferedWriteCloser) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	flushErr := b.w.Flush()
+	return errors.Join(flushErr, b.f.Close())
+}
+func getOutputStream(filename string) (*bufferedWriteCloser, error) {
+	f := os.Stdout
+	if filename != "" {
+		var err error
+		f, err = os.Create(filename)
+		if err != nil {
+			return nil, fmt.Errorf("cannot create file: %w", err)
+		}
 	}
-	f, err := os.Create(filename)
-	if err != nil {
-		return nil, fmt.Errorf("cannot create file: %w", err)
-	}
-	return &bufferedWriteCloser{w: bufio.NewWriter(f), f: f}, nil
+	return &bufferedWriteCloser{w: bufio.NewWriterSize(f, 64<<10), f: f}, nil
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
-	if err := rootCmd.Execute(); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := rootCmd.ExecuteContext(ctx); err != nil {
 		os.Exit(1)
 	}
 }

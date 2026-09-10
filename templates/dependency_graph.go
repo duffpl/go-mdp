@@ -3,230 +3,165 @@ package templates
 import (
 	"fmt"
 	"github.com/duffpl/go-mdp/v2/config"
-	"golang.org/x/exp/slices"
-	"regexp"
+	"sort"
+	"strings"
 	"text/template/parse"
 )
 
-// CompileTemplates compiles templates with the funcs registered with
-// RegisterTemplateFuncs. Prefer Registry.CompileTemplates.
-func CompileTemplates(templates map[string]config.Template, namePrefix string) (map[string]*Template, error) {
-	return defaultReg().CompileTemplates(templates, namePrefix)
+func CompileTemplates(source map[string]config.Template, prefix string) (map[string]*Template, error) {
+	return defaultReg().CompileTemplates(source, prefix)
 }
-
-func (r *Registry) CompileTemplates(templates map[string]config.Template, namePrefix string) (map[string]*Template, error) {
-	compiledTemplates := make(map[string]*Template)
-	for name, _template := range templates {
-		prefixedName := "." + namePrefix + "." + name
-		compiledTemplate, err := r.GetCompiledTemplate(string(_template), prefixedName)
-		if err != nil {
-			return nil, fmt.Errorf("cannot compile template %s: %w", prefixedName, err)
-		}
-		compiledTemplates[prefixedName] = &Template{
-			CompiledTemplate: compiledTemplate,
-			Dependencies:     nil,
-			Name:             prefixedName,
-		}
+func (r *Registry) CompileTemplates(source map[string]config.Template, prefix string) (map[string]*Template, error) {
+	prefixed := make(map[string]config.Template, len(source))
+	for name, text := range source {
+		prefixed["."+prefix+"."+name] = text
 	}
-	// build dependency graph
-	for name, compiledTemplate := range compiledTemplates {
-		dependencies := ExtractVariables(compiledTemplate.CompiledTemplate.Tree.Root, namePrefix)
-		for _, dependency := range dependencies {
-			dependencyTemplate, ok := compiledTemplates[dependency]
-			if !ok {
-				return nil, fmt.Errorf("template %s depends on %s, but %s is not defined", name, dependency, dependency)
-			}
-			compiledTemplate.Dependencies = append(compiledTemplate.Dependencies, dependencyTemplate)
-		}
+	return r.CompileAllTemplates(prefixed)
+}
+func CompileAllTemplates(source map[string]config.Template) (map[string]*Template, error) {
+	return defaultReg().CompileAllTemplates(source)
+}
+func (r *Registry) CompileAllTemplates(source map[string]config.Template) (map[string]*Template, error) {
+	compiled := make(map[string]*Template, len(source))
+	names := make([]string, 0, len(source))
+	for name := range source {
+		names = append(names, name)
 	}
-	return compiledTemplates, nil
-}
-
-// CompileAllTemplates compiles templates with the funcs registered with
-// RegisterTemplateFuncs. Prefer Registry.CompileAllTemplates.
-func CompileAllTemplates(templates map[string]config.Template) (map[string]*Template, error) {
-	return defaultReg().CompileAllTemplates(templates)
-}
-
-func (r *Registry) CompileAllTemplates(templates map[string]config.Template) (map[string]*Template, error) {
-	compiledTemplates := make(map[string]*Template)
-	allTemplateNames := []string{}
-	for name, _template := range templates {
-		allTemplateNames = append(allTemplateNames, name)
-		compiledTemplate, err := r.GetCompiledTemplate(string(_template), name)
+	sort.Strings(names)
+	for _, name := range names {
+		t, err := r.GetCompiledTemplate(string(source[name]), name)
 		if err != nil {
 			return nil, fmt.Errorf("cannot compile template %s: %w", name, err)
 		}
-		compiledTemplates[name] = &Template{
-			CompiledTemplate: compiledTemplate,
-			Dependencies:     nil,
-			Name:             name,
-		}
+		compiled[name] = &Template{Name: name, CompiledTemplate: t}
 	}
-	// build dependency graph
-	for name, compiledTemplate := range compiledTemplates {
-		dependencies := ExtractDependencies(compiledTemplate.CompiledTemplate.Tree.Root, allTemplateNames)
-		for _, dependency := range dependencies {
-			dependencyTemplate, ok := compiledTemplates[dependency]
-			if !ok {
-				return nil, fmt.Errorf("template %s depends on %s, but %s is not defined", name, dependency, dependency)
+	for _, name := range names {
+		t := compiled[name]
+		refs, err := templateReferences(t.CompiledTemplate)
+		if err != nil {
+			return nil, fmt.Errorf("template %s: %w", name, err)
+		}
+		seen := make(map[string]bool)
+		for _, ref := range refs {
+			matches := matchingDependencies(ref, names)
+			if len(matches) == 0 && variableReference(ref, names) && strings.Count(ref, ".") >= 2 {
+				return nil, fmt.Errorf("template %s depends on %s, but %s is not defined", name, ref, ref)
 			}
-			compiledTemplate.Dependencies = append(compiledTemplate.Dependencies, dependencyTemplate)
+			for _, dep := range matches {
+				if !seen[dep] {
+					t.Dependencies = append(t.Dependencies, compiled[dep])
+					seen[dep] = true
+				}
+			}
 		}
 	}
-	return compiledTemplates, nil
+	// Validate all configured variables, including those not currently used by a column.
+	if _, err := GetOrderedTemplates(compiled); err != nil {
+		return nil, err
+	}
+	return compiled, nil
+}
+func isVariableReference(path string) bool {
+	for _, scope := range []string{"GlobalVariables", "TableVariables", "RowVariables", "ColumnVariables"} {
+		if path == "."+scope || strings.HasPrefix(path, "."+scope+".") {
+			return true
+		}
+	}
+	return false
 }
 
-func ExtractDependencies(rootNode *parse.ListNode, templateNames []string) []string {
-	var result []string
-	var variableRegexes []*regexp.Regexp
-	for _, templateName := range templateNames {
-		variableRegexes = append(variableRegexes, regexp.MustCompile(templateName))
+func variableReference(ref string, names []string) bool {
+	if isVariableReference(ref) {
+		return true
 	}
-	matchAnyRegex := func(input string) bool {
-		for _, regex := range variableRegexes {
-			if regex.MatchString(input) {
-				return true
-			}
-		}
+	prefix, _, ok := strings.Cut(strings.TrimPrefix(ref, "."), ".")
+	if !ok {
 		return false
 	}
-	for _, node := range rootNode.Nodes {
-		switch node.Type() {
-		case parse.NodeAction:
-			actionNode := node.(*parse.ActionNode)
-			if actionNode.Pipe == nil {
-				continue
-			}
-			for _, pipeCmd := range actionNode.Pipe.Cmds {
-				if pipeCmd.NodeType != parse.NodeCommand {
-					continue
-				}
-				for _, arg := range pipeCmd.Args {
-					if arg.Type() != parse.NodeField {
-						continue
-					}
-					variableName := arg.String()
-					if !matchAnyRegex(variableName) {
-						continue
-					}
-					// check if the dependency is already in the list
-					if !slices.Contains(result, variableName) {
-						result = append(result, variableName)
-					}
-				}
+	for _, name := range names {
+		if strings.HasPrefix(name, "."+prefix+".") {
+			return true
+		}
+	}
+	return false
+}
+func matchingDependencies(ref string, names []string) []string {
+	var result []string
+	for _, name := range names {
+		// Match complete path segments, never regex substrings. Reading a whole map
+		// conservatively requires all its entries.
+		if ref == name || (ref == "." && strings.HasPrefix(name, ".")) || (strings.Count(ref, ".") == 1 && strings.HasPrefix(name, ref+".")) {
+			result = append(result, name)
+		}
+	}
+	return result
+}
+func ExtractDependencies(root *parse.ListNode, names []string) []string {
+	w := newReferenceWalker(nil)
+	w.list(root, rootScope("."))
+	seen := make(map[string]bool)
+	var result []string
+	for _, ref := range w.refs {
+		for _, name := range matchingDependencies(ref, names) {
+			if !seen[name] {
+				result = append(result, name)
+				seen[name] = true
 			}
 		}
 	}
 	return result
 }
-func ExtractVariables(rootNode *parse.ListNode, prefix string) (result []string) {
-	variableNameRegexp := regexp.MustCompile(`\.` + prefix + `\.`)
-	for _, node := range rootNode.Nodes {
-		switch node.Type() {
-		case parse.NodeAction:
-			actionNode := node.(*parse.ActionNode)
-			if actionNode.Pipe == nil {
-				continue
-			}
-			for _, pipeCmd := range actionNode.Pipe.Cmds {
-				if pipeCmd.NodeType != parse.NodeCommand {
-					continue
-				}
-				for _, arg := range pipeCmd.Args {
-					if arg.Type() != parse.NodeField {
-						continue
-					}
-					variableName := arg.String()
-					if !variableNameRegexp.MatchString(variableName) {
-						continue
-					}
-					// check if the variable is already in the list
-					if !slices.Contains(result, variableName) {
-						result = append(result, variableName)
-					}
-				}
-			}
+func ExtractVariables(root *parse.ListNode, prefix string) []string {
+	w := newReferenceWalker(nil)
+	w.list(root, rootScope("."))
+	var result []string
+	for _, ref := range w.refs {
+		if strings.HasPrefix(ref, "."+prefix+".") {
+			result = append(result, ref)
 		}
 	}
-	return
+	return result
 }
-func GetDependencyStackForMultipleTemplates(templateNames []string, templates map[string]*Template) ([]*Template, error) {
+func GetDependencyStackForMultipleTemplates(names []string, templates map[string]*Template) ([]*Template, error) {
 	var stack []*Template
-	visited := make(map[string]bool)
-
-	for _, templateName := range templateNames {
-		// Check if the template exists
-		template, exists := templates[templateName]
-		if !exists {
-			return nil, fmt.Errorf("template %s does not exist", templateName)
+	state := make(map[string]uint8)
+	var path []string
+	var visit func(string) error
+	visit = func(name string) error {
+		if state[name] == 1 {
+			return fmt.Errorf("cycle detected: %s", strings.Join(append(path, name), " -> "))
 		}
-
-		// Start depth-first search
-		err := dfs(template, templates, &stack, visited)
-		if err != nil {
+		if state[name] == 2 {
+			return nil
+		}
+		t, ok := templates[name]
+		if !ok {
+			return fmt.Errorf("template %s does not exist", name)
+		}
+		state[name] = 1
+		path = append(path, name)
+		for _, dep := range t.Dependencies {
+			if err := visit(dep.Name); err != nil {
+				return err
+			}
+		}
+		path = path[:len(path)-1]
+		state[name] = 2
+		stack = append(stack, t)
+		return nil
+	}
+	for _, name := range names {
+		if err := visit(name); err != nil {
 			return nil, err
 		}
 	}
-
 	return stack, nil
-}
-
-func dfs(template *Template, templates map[string]*Template, stack *[]*Template, visited map[string]bool) error {
-	if visited[template.Name] {
-		return nil
-	}
-	visited[template.Name] = true
-	for _, dep := range template.Dependencies {
-		depTemplate, exists := templates[dep.Name]
-		if !exists {
-			return fmt.Errorf("template %s depends on %s, but %s does not exist", template.Name, dep.Name, dep.Name)
-		}
-		err := dfs(depTemplate, templates, stack, visited)
-		if err != nil {
-			return err
-		}
-	}
-	*stack = append(*stack, template)
-
-	return nil
 }
 func GetOrderedTemplates(templates map[string]*Template) ([]*Template, error) {
-	visited := make(map[string]bool)
-	recursionStack := make(map[string]bool)
-	stack := []*Template{}
-
-	var dfs func(node string) error
-	dfs = func(name string) error {
-		if _, ok := templates[name]; !ok {
-			return fmt.Errorf("template %s not found", name)
-		}
-		if !visited[name] {
-			visited[name] = true
-			recursionStack[name] = true
-			for _, dep := range templates[name].Dependencies {
-				if recursionStack[dep.Name] {
-					return fmt.Errorf("cycle detected: %s is part of a cycle", dep.Name)
-				}
-				if !visited[dep.Name] {
-					if err := dfs(dep.Name); err != nil {
-						return err
-					}
-				}
-			}
-			stack = append(stack, templates[name])
-		}
-		delete(recursionStack, name)
-		return nil
-	}
-
+	names := make([]string, 0, len(templates))
 	for name := range templates {
-		if !visited[name] {
-			if err := dfs(name); err != nil {
-				return nil, err
-			}
-		}
+		names = append(names, name)
 	}
-
-	return stack, nil
+	sort.Strings(names)
+	return GetDependencyStackForMultipleTemplates(names, templates)
 }

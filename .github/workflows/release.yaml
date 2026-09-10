@@ -1,19 +1,49 @@
-# .github/workflows/release.yaml
-
-on: release
 name: Build Release
+on:
+  release:
+    types: [published]
+permissions:
+  contents: read
 jobs:
-    release-linux-amd64:
-        name: release linux/amd64
-        runs-on: ubuntu-latest
-        steps:
-            - uses: actions/checkout@master
-            - name: compile and release
-              uses: ngs/go-release.action@master
-              env:
-                  GO111MODULE: on
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-                  GOARCH: amd64
-                  GOOS: linux
-                  EXTRA_FILES: "LICENSE"
-                  PROJECT_NAME: go-mdp
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.24.13'
+      - run: go test -race ./... -count=1
+      - run: go vet ./...
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.24.13'
+      - name: Build and upload Linux archive
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags='-s -w' -o dist/go-mdp .
+          cp LICENSE dist/LICENSE
+          archive="go-mdp_${RELEASE_TAG}_linux_${GOARCH}.tgz"
+          checksum="go-mdp_${RELEASE_TAG}_linux_${GOARCH}_checksum.txt"
+          tar -czf "$archive" -C dist go-mdp LICENSE
+          sha256sum "$archive" > "$checksum"
+          gh release upload "$RELEASE_TAG" "$archive" "$checksum"

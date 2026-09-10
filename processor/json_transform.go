@@ -6,13 +6,29 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/duffpl/go-mdp/v2/templates"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
 type jsonFieldOp struct {
-	path     string
-	template *template.Template
+	path            string
+	template        *template.Template
+	templateName    string
+	columnVariables []*templates.Template
+}
+
+// JSON column variables are scoped to each field/array element, whose current
+// value becomes .FieldValue. Never carry a previous field's variables forward.
+func (field jsonFieldOp) execute(buf *bytes.Buffer, data *columnTemplateData) error {
+	clear(data.ColumnVariables)
+	if len(field.columnVariables) > 0 && data.ColumnVariables == nil {
+		data.ColumnVariables = make(map[string]string)
+	}
+	if err := renderColumnVariables(field.columnVariables, data); err != nil {
+		return err
+	}
+	return field.template.Execute(buf, data)
 }
 
 // applyJsonTransform applies JSON field transformations to a JSON string.
@@ -42,7 +58,7 @@ func applyJsonTransform(jsonStr string, fields []jsonFieldOp, data *columnTempla
 			data.FieldValue = val.String()
 
 			var buf bytes.Buffer
-			if err := field.template.Execute(&buf, data); err != nil {
+			if err := field.execute(&buf, data); err != nil {
 				data.FieldValue = originalFieldValue
 				return "", fmt.Errorf("template execution failed for path '%s': %w", field.path, err)
 			}
@@ -105,7 +121,7 @@ func applyArrayWildcard(jsonStr string, field jsonFieldOp, data *columnTemplateD
 		data.FieldValue = val.String()
 
 		var buf bytes.Buffer
-		if err := field.template.Execute(&buf, data); err != nil {
+		if err := field.execute(&buf, data); err != nil {
 			data.FieldValue = originalFieldValue
 			return "", fmt.Errorf("template execution failed for path '%s[%d].%s': %w", arrayPath, i, fieldSuffix, err)
 		}

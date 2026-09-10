@@ -2,6 +2,8 @@ package processor
 
 import (
 	"errors"
+	"strings"
+
 	"github.com/pingcap/tidb/pkg/parser/types"
 )
 
@@ -15,7 +17,7 @@ type columnMap map[int]ColumnSchema
 
 func (c columnMap) GetByName(name string) (ColumnSchema, error) {
 	for i := range c {
-		if c[i].Name == name {
+		if strings.EqualFold(c[i].Name, name) {
 			return c[i], nil
 		}
 	}

@@ -1,23 +1,19 @@
 package processor
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"fmt"
-	"io"
-	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/duffpl/go-mdp/v2/config"
 	"github.com/duffpl/go-mdp/v2/faker"
 	"github.com/duffpl/go-mdp/v2/templates"
 	"github.com/duffpl/go-mdp/v2/transformations"
-	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/format"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
@@ -37,17 +33,18 @@ func getBuffer() *bytes.Buffer {
 }
 
 func putBuffer(buf *bytes.Buffer) {
-	bufferPool.Put(buf)
+	// Do not retain extended INSERT buffers for small field transformations.
+	if buf.Cap() <= 64<<10 {
+		bufferPool.Put(buf)
+	}
 }
 
 type Processor struct {
 	Config               config.Config
 	tableTransformations map[string]*PreparedTableConfig
-	globalVariables      map[string]string
-	schemaMapLock        *sync.Mutex
-	tableSchemas         map[string]TableSchema
-	schemaReadyCond      *sync.Cond // condition variable to wait for schema
+	processMu            sync.Mutex
 	processedTables      []string
+	progress             atomic.Pointer[runProgress]
 }
 
 func NewProcessorWithConfig(configData config.Config) (*Processor, error) {
@@ -55,6 +52,9 @@ func NewProcessorWithConfig(configData config.Config) (*Processor, error) {
 }
 
 func NewProcessor(config config.Config) (*Processor, error) {
+	if config.Settings.Workers < 0 || config.Settings.MaxInFlightBytes < 0 || config.Settings.MaxStatementBytes < 0 {
+		return nil, fmt.Errorf("worker and memory limits cannot be negative")
+	}
 	// Faker funcs are bound to the configured locale and text/template resolves
 	// them at parse time, so every processor compiles against its own registry.
 	// A process-wide cache would hand this processor the templates whichever
@@ -72,19 +72,7 @@ func NewProcessor(config config.Config) (*Processor, error) {
 			tableTransformations[tableName] = &PreparedTableConfig{Skip: true}
 		}
 	}
-	schemaLock := &sync.Mutex{}
-	p := &Processor{
-		Config:               config,
-		tableTransformations: tableTransformations,
-		tableSchemas:         make(map[string]TableSchema),
-		schemaMapLock:        schemaLock,
-		schemaReadyCond:      sync.NewCond(schemaLock),
-	}
-	globalVariables, err := renderGlobalVariables(config, registry)
-	if err != nil {
-		return nil, fmt.Errorf("cannot render global variables: %w", err)
-	}
-	p.globalVariables = globalVariables
+	p := &Processor{Config: config, tableTransformations: tableTransformations}
 	return p, nil
 }
 
@@ -92,60 +80,47 @@ func NewProcessor(config config.Config) (*Processor, error) {
 // CREATE TABLE statements during the most recent Process() call.
 // Must be called after Process() returns.
 func (p *Processor) ProcessedTables() []string {
+	p.processMu.Lock()
+	defer p.processMu.Unlock()
 	result := make([]string, len(p.processedTables))
 	copy(result, p.processedTables)
 	sort.Strings(result)
 	return result
 }
 
-func (p *Processor) processCreateTableStatement(stmt *ast.CreateTableStmt) {
-	tableName := stmt.Table.Name.String()
-	schema := TableSchema{
-		Columns: make(columnMap),
-		Name:    tableName,
+func schemaFromCreate(stmt *ast.CreateTableStmt) (TableSchema, error) {
+	if len(stmt.Cols) == 0 {
+		return TableSchema{}, fmt.Errorf("table %s: CREATE TABLE has no column definitions", stmt.Table.Name.O)
 	}
-	for i := range stmt.Cols {
-		col := stmt.Cols[i]
-		schema.Columns[i] = ColumnSchema{
-			Type:  col.Tp,
-			Index: i,
-			Name:  col.Name.String(),
-		}
+	schema := TableSchema{Columns: make(columnMap), Name: stmt.Table.Name.O}
+	for i, col := range stmt.Cols {
+		schema.Columns[i] = ColumnSchema{Type: col.Tp, Index: i, Name: col.Name.Name.O}
 	}
-	p.schemaMapLock.Lock()
-	p.tableSchemas[tableName] = schema
-	p.schemaReadyCond.Broadcast() // wake up any goroutines waiting for this schema
-	p.schemaMapLock.Unlock()
+	return schema, nil
 }
 
-// waitForSchema blocks until the schema for tableName is available or context is cancelled
-func (p *Processor) waitForSchema(ctx context.Context, tableName string) (TableSchema, error) {
-	p.schemaMapLock.Lock()
-	defer p.schemaMapLock.Unlock()
-	for {
-		if schema, ok := p.tableSchemas[tableName]; ok {
-			return schema, nil
-		}
-		if ctx.Err() != nil {
-			return TableSchema{}, fmt.Errorf("context cancelled while waiting for schema of table %s: %w", tableName, ctx.Err())
-		}
-		// Wake up when context is cancelled so we don't block forever
-		done := make(chan struct{})
-		go func() {
-			select {
-			case <-ctx.Done():
-				// Broadcast under the lock: otherwise the wakeup can fire
-				// between the waiter's ctx.Err() check and cond.Wait()
-				// registering, and the waiter sleeps through cancellation.
-				p.schemaMapLock.Lock()
-				p.schemaReadyCond.Broadcast()
-				p.schemaMapLock.Unlock()
-			case <-done:
-			}
-		}()
-		p.schemaReadyCond.Wait()
-		close(done)
+// Resolve explicit INSERT column order against this statement's immutable schema.
+func insertSchema(stmt *ast.InsertStmt, schema TableSchema) (TableSchema, error) {
+	if len(stmt.Columns) == 0 {
+		return schema, nil
 	}
+	columns := make(columnMap, len(stmt.Columns))
+	seen := make(map[string]bool, len(stmt.Columns))
+	for i, name := range stmt.Columns {
+		key := strings.ToLower(name.Name.O)
+		if seen[key] {
+			return TableSchema{}, fmt.Errorf("duplicate INSERT column %s", name.Name.O)
+		}
+		seen[key] = true
+		col, err := schema.Columns.GetByName(name.Name.O)
+		if err != nil {
+			return TableSchema{}, fmt.Errorf("unknown INSERT column %s", name.Name.O)
+		}
+		col.Index = i
+		columns[i] = col
+	}
+	schema.Columns = columns
+	return schema, nil
 }
 
 type rowTemplateData struct {
@@ -157,13 +132,25 @@ type rowTemplateData struct {
 }
 
 type columnTemplateData struct {
-	rowTemplateData
+	Row             transformations.MappedRow
+	RowMeta         transformations.RowMeta
+	RowVariables    map[string]string
+	GlobalVariables map[string]string
+	TableVariables  map[string]string
 	ColumnVariables map[string]string
 	FieldValue      interface{}
 }
 
+func (c *columnTemplateData) setRow(r *rowTemplateData) {
+	c.Row, c.RowMeta = r.Row, r.RowMeta
+	c.RowVariables, c.GlobalVariables, c.TableVariables = r.RowVariables, r.GlobalVariables, r.TableVariables
+}
+
 func mapInsertRowToColumns(insertRow []ast.ExprNode, tableSchema TableSchema, result transformations.MappedRow) error {
 	clear(result)
+	if len(insertRow) != len(tableSchema.Columns) {
+		return fmt.Errorf("INSERT has %d values for %d columns", len(insertRow), len(tableSchema.Columns))
+	}
 	for i := range insertRow {
 		field, ok := insertRow[i].(ast.ValueExpr)
 		if !ok {
@@ -175,12 +162,13 @@ func mapInsertRowToColumns(insertRow []ast.ExprNode, tableSchema TableSchema, re
 	return nil
 }
 
-func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.InsertStmt, tableConfig *PreparedTableConfig, startRowIndex int) (string, error) {
-	tableName := stmt.Table.TableRefs.Left.(*ast.TableSource).Source.(*ast.TableName).Name.String()
-	// Wait for schema to be available (CREATE TABLE must be processed first)
-	schema, err := p.waitForSchema(ctx, tableName)
+func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.InsertStmt, tableConfig *PreparedTableConfig, startRowIndex int, schema TableSchema) (string, error) {
+	schema, err := insertSchema(stmt, schema)
 	if err != nil {
 		return "", err
+	}
+	if len(stmt.Lists) == 0 {
+		return "", fmt.Errorf("only INSERT VALUES statements are supported for transformed tables")
 	}
 	allInsertRows := stmt.Lists
 	reusableRow := make(transformations.MappedRow, len(schema.Columns))
@@ -193,6 +181,9 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 		ColumnVariables: make(map[string]string),
 	}
 	for currentRowIndex := range allInsertRows {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		// Use pre-computed row index (no lock needed)
 		tableRowIndex := startRowIndex + currentRowIndex
 		currentRow := allInsertRows[currentRowIndex]
@@ -214,6 +205,9 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 		}
 
 		for columnIdx := range currentRow {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
 			columnSchema := schema.Columns[columnIdx]
 
 			// Check if we have ColumnOps (new path)
@@ -221,10 +215,9 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 				for _, op := range columnOps {
 					switch op.Type {
 					case "template":
-						currentColumn := currentRow[columnIdx]
 						columnVariablesTemplates := tableConfig.ColumnVariableDepsPerTemplate[op.CompiledTemplate]
-						columnData.rowTemplateData = *rowData
-						columnData.FieldValue = currentColumn.(ast.ValueExpr).GetString()
+						columnData.setRow(rowData)
+						columnData.FieldValue = currentRow[columnIdx].(ast.ValueExpr).GetString()
 						clear(columnData.ColumnVariables)
 						err = renderColumnVariables(columnVariablesTemplates, columnData)
 						if err != nil {
@@ -241,7 +234,7 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 						currentRow[columnIdx] = ast.NewValueExpr(result, mysql.UTF8Charset, mysql.UTF8Charset)
 					case "json":
 						currentValue := currentRow[columnIdx].(ast.ValueExpr).GetString()
-						columnData.rowTemplateData = *rowData
+						columnData.setRow(rowData)
 						columnData.FieldValue = currentValue
 						clear(columnData.ColumnVariables)
 						transformedJSON, err := applyJsonTransform(currentValue, op.JsonFields, columnData)
@@ -255,7 +248,6 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 			}
 
 			// Legacy path: use ColumnTemplates
-			currentColumn := currentRow[columnIdx]
 			columnTemplates, ok := tableConfig.ColumnTemplates[columnSchema.Name]
 			if !ok {
 				continue
@@ -265,8 +257,8 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 					return "", fmt.Errorf("cannot get transformation function: %w", err)
 				}
 				columnVariablesTemplates := tableConfig.ColumnVariableDepsPerTemplate[tmpl]
-				columnData.rowTemplateData = *rowData
-				columnData.FieldValue = currentColumn.(ast.ValueExpr).GetString()
+				columnData.setRow(rowData)
+				columnData.FieldValue = currentRow[columnIdx].(ast.ValueExpr).GetString()
 				clear(columnData.ColumnVariables)
 				err = renderColumnVariables(columnVariablesTemplates, columnData)
 				if err != nil {
@@ -290,7 +282,8 @@ func (p *Processor) processInsertStatement(ctx context.Context, stmt *ast.Insert
 		putBuffer(buf)
 		return "", fmt.Errorf("cannot restore insert statement: %w", err)
 	}
-	result := buf.String() + ";\n"
+	buf.WriteString(";\n")
+	result := buf.String()
 	putBuffer(buf)
 	return result, nil
 }
@@ -331,391 +324,10 @@ func renderColumnVariables(
 	return nil
 }
 
-type preparsedStatement interface {
-	GetType() string
-}
-
-type preparsedStatementWithTable interface {
-	GetTableName() string
-}
-
-type preparsedCreateStmt struct {
-	tableName string
-}
-
-func (p preparsedCreateStmt) GetTableName() string {
-	return p.tableName
-}
-
-func (p preparsedCreateStmt) GetType() string {
-	return "create"
-}
-
-type preparsedInsertStmt struct {
-	tableName string
-}
-
-func (p preparsedInsertStmt) GetTableName() string {
-	return p.tableName
-}
-
-func (p preparsedInsertStmt) GetType() string {
-	return "insert"
-}
-
-var preparseRegexps = map[statementType]*regexp.Regexp{
-	statementTypeInsert:      regexp.MustCompile(`(?mi)^(?:\/\*!\d+ )?INSERT(?: (?:LOWPRIORITY|DELAYED|HIGH_PRIORITY))?(?: IGNORE)? INTO \x60?(\w+)\x60?`),
-	statementTypeCreateTable: regexp.MustCompile(`(?mi)^(?:\/\*!\d+ )?CREATE(?: TEMPORARY)? TABLE(?: IF NOT EXISTS)? \x60?(\w+)\x60?`),
-}
-
-func preparse(line string) preparsedStatement {
-	for statementType := range preparseRegexps {
-		expression := preparseRegexps[statementType]
-		matches := expression.FindStringSubmatch(line)
-		if len(matches) > 0 {
-			switch statementType {
-			case statementTypeCreateTable:
-				return preparsedCreateStmt{tableName: matches[1]}
-			case statementTypeInsert:
-				return preparsedInsertStmt{tableName: matches[1]}
-			}
-		}
-	}
-	return nil
-}
-func readStatements(input io.Reader, ctx context.Context) (chan string, chan error) {
-	outputCh := make(chan string, 100)
-	bufferedInput := bufio.NewReader(input)
-	errCh := make(chan error)
-	go func() {
-		currentStatementLine := strings.Builder{}
-		defer func() {
-			close(outputCh)
-			close(errCh)
-		}()
-		// Sends must abort on ctx cancellation: once downstream stops draining
-		// (error path or cancel), a bare send would block this goroutine forever.
-		send := func(line string) bool {
-			select {
-			case outputCh <- line:
-				return true
-			case <-ctx.Done():
-				return false
-			}
-		}
-		sendErr := func(err error) {
-			select {
-			case errCh <- err:
-			case <-ctx.Done():
-			}
-		}
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			line, err := bufferedInput.ReadString('\n')
-			if err != nil && err != io.EOF {
-				sendErr(err)
-				return
-			}
-			isEOF := err == io.EOF
-			line = strings.TrimSpace(line)
-			if len(line) == 0 {
-				if isEOF {
-					return
-				}
-				if !send(line) {
-					return
-				}
-				continue
-			}
-			_, err = currentStatementLine.Write([]byte(line + "\n"))
-			if err != nil {
-				sendErr(err)
-				return
-			}
-			lastCharacter := line[len(line)-1:]
-			if lastCharacter == ";" {
-				if !send(currentStatementLine.String()) {
-					return
-				}
-				currentStatementLine = strings.Builder{}
-			}
-			if isEOF {
-				remaining := strings.TrimSpace(currentStatementLine.String())
-				if len(remaining) > 0 {
-					send(remaining + "\n")
-				}
-				return
-			}
-		}
-	}()
-	return outputCh, errCh
-}
-
-func (p *Processor) processLine(ctx context.Context, line string, parser *parser.Parser, startRowIndex int, preparseResult preparsedStatement, schemaDispatched bool) (string, error) {
-	var tableName string
-	switch v := preparseResult.(type) {
-	case nil:
-		return line, nil // passthrough: not a CREATE/INSERT
-	case preparsedStatementWithTable:
-		tableName = v.GetTableName()
-	}
-	// Track all CREATE TABLE names at preparse level (before config lookup — works with empty configs)
-	if _, isCreate := preparseResult.(preparsedCreateStmt); isCreate {
-		p.schemaMapLock.Lock()
-		p.processedTables = append(p.processedTables, tableName)
-		p.schemaMapLock.Unlock()
-	}
-
-	tableTransformations, ok := p.tableTransformations[tableName]
-	if !ok {
-		return line, nil // passthrough: table not configured
-	}
-	// Skip INSERT statements for tables with Skip=true (before AST parsing for performance)
-	if tableTransformations.Skip {
-		if _, isInsert := preparseResult.(preparsedInsertStmt); isInsert {
-			return "", nil
-		}
-	}
-	// Fail fast when no CREATE TABLE for this table appeared earlier in the input:
-	// the schema will never become available, and waiting for it would block a
-	// worker forever (deadlocking the pool once every worker waits).
-	if _, isInsert := preparseResult.(preparsedInsertStmt); isInsert && !schemaDispatched {
-		return line, fmt.Errorf("cannot process INSERT for table %s: no CREATE TABLE statement found earlier in the input, schema is unknown", tableName)
-	}
-	parseResult, _, err := parser.Parse(line, mysql.UTF8Charset, mysql.UTF8Charset)
-	if err != nil {
-		return line, fmt.Errorf("cannot parse statement for table %s: %w", tableName, err)
-	}
-	statement := parseResult[0]
-	switch stmt := statement.(type) {
-	case *ast.InsertStmt:
-		line, err = p.processInsertStatement(ctx, stmt, tableTransformations, startRowIndex)
-		if err != nil {
-			return line, fmt.Errorf("cannot process insert statement for table %s: %w", tableName, err)
-		}
-	case *ast.CreateTableStmt:
-		p.processCreateTableStatement(stmt)
-	}
-	return line, nil
-}
-
-type lineWithOutputChannel struct {
-	line             string
-	outputChannel    chan string
-	startRowIndex    int                // pre-computed starting row index for this statement
-	preparsed        preparsedStatement // pre-computed statement type to avoid duplicate regex work
-	schemaDispatched bool               // for INSERTs: a CREATE TABLE for this table appeared earlier in the input
-}
-
-// countInsertRows quickly counts the number of value tuples in an INSERT statement
-// by counting occurrences of "),(" plus 1 for the first tuple
-var rowCountRegex = regexp.MustCompile(`\),\s*\(`)
-
-func countInsertRows(line string) int {
-	matches := rowCountRegex.FindAllStringIndex(line, -1)
-	return len(matches) + 1 // +1 for the first tuple
-}
-
-func (p *Processor) processLines(input chan string, ctx context.Context) (chan chan string, chan error) {
-	outputCh := make(chan chan string, 100)
-	errCh := make(chan error, 1) // buffered to ensure error is never dropped
-	linesForProcessing := make(chan lineWithOutputChannel, 100)
-	processorCount := runtime.NumCPU()
-	lineProcessorsWg := sync.WaitGroup{}
-
-	// Create a cancellable context for coordinated shutdown
-	processingCtx, cancelProcessing := context.WithCancel(ctx)
-
-	// Row counters per table - only accessed by dispatcher goroutine (no lock needed)
-	tableRowCounters := make(map[string]int)
-	// Tables whose CREATE TABLE has been dispatched - only accessed by dispatcher goroutine
-	dispatchedSchemas := make(map[string]bool)
-
-	go func() {
-		defer close(linesForProcessing)
-		for line := range input {
-			select {
-			case <-processingCtx.Done():
-				// Stop creating new work if processing is cancelled
-				return
-			default:
-			}
-
-			// Pre-compute row index for INSERT statements
-			var startRowIndex int
-			var schemaDispatched bool
-			preparsed := preparse(line)
-			switch stmt := preparsed.(type) {
-			case preparsedCreateStmt:
-				dispatchedSchemas[stmt.GetTableName()] = true
-			case preparsedInsertStmt:
-				name := stmt.GetTableName()
-				schemaDispatched = dispatchedSchemas[name]
-				rowCount := countInsertRows(line)
-				startRowIndex = tableRowCounters[name] + 1 // 1-based indexing
-				tableRowCounters[name] += rowCount
-			}
-
-			processedCh := make(chan string, 1) // buffered to prevent blocking
-			select {
-			case outputCh <- processedCh:
-			case <-processingCtx.Done():
-				close(processedCh)
-				return
-			}
-			select {
-			case linesForProcessing <- lineWithOutputChannel{
-				line:             line,
-				outputChannel:    processedCh,
-				startRowIndex:    startRowIndex,
-				preparsed:        preparsed,
-				schemaDispatched: schemaDispatched,
-			}:
-			case <-processingCtx.Done():
-				close(processedCh)
-				return
-			}
-		}
-	}()
-
-	for i := 0; i < processorCount; i++ {
-		lineProcessorsWg.Add(1)
-		go func() {
-			defer lineProcessorsWg.Done()
-			stmtParser := parser.New()
-			for {
-				select {
-				case <-processingCtx.Done():
-					// Drain remaining work and close orphaned channels
-					for work := range linesForProcessing {
-						close(work.outputChannel)
-					}
-					return
-				case currentLine, ok := <-linesForProcessing:
-					if !ok {
-						return
-					}
-					processedLine, err := p.processLine(processingCtx, currentLine.line, stmtParser, currentLine.startRowIndex, currentLine.preparsed, currentLine.schemaDispatched)
-					if err != nil {
-						currentLine.outputChannel <- fmt.Sprintf("/* error: %s */\n%s", err.Error(), currentLine.line)
-						// Cancel processing context to stop all goroutines
-						cancelProcessing()
-						// Drain remaining work and close orphaned channels FIRST
-						// This allows the main loop to finish reading from those channels
-						for work := range linesForProcessing {
-							close(work.outputChannel)
-						}
-						// Now send the error - main loop can receive it
-						select {
-						case errCh <- err:
-						default:
-						}
-						return
-					}
-					currentLine.outputChannel <- processedLine
-				}
-			}
-		}()
-	}
-	go func() {
-		lineProcessorsWg.Wait()
-		cancelProcessing() // Ensure context is cancelled when workers finish
-		// Close order matters: Process()'s shutdown drain blocks on errCh
-		// after observing outputCh closed, relying on errCh closing right after.
-		close(outputCh)
-		close(errCh)
-	}()
-	return outputCh, errCh
-}
-
 var restoreFlags = format.RestoreStringSingleQuotes |
 	format.RestoreKeyWordLowercase |
 	format.RestoreNameBackQuotes |
 	format.RestoreStringEscapeBackslash
-
-func (p *Processor) Process(input io.Reader, output io.Writer, pCtx context.Context) (err error) {
-	p.processedTables = nil // reset for this call
-	// Process-scoped context: cancelled when Process returns for any reason,
-	// so pipeline goroutines (reader, dispatcher, workers) never stay blocked
-	// after an error path stops draining their channels.
-	ctx, cancel := context.WithCancel(pCtx)
-	defer cancel()
-	readLines, inputErrors := readStatements(input, ctx)
-	processedLinesChans, processingErrors := p.processLines(readLines, ctx)
-	done := make(chan error, 1)
-	go func() {
-		defer close(done)
-		for {
-			select {
-			case <-pCtx.Done():
-				done <- pCtx.Err()
-				return
-			case processedLineCh, ok := <-processedLinesChans:
-				if !ok {
-					// Workers are done, but a buffered error may still be
-					// pending — without this drain the select above can race
-					// past it and report success on a failed run.
-					// processingErrors is closed right after processedLinesChans,
-					// so a blocking read returns promptly.
-					if procErr := <-processingErrors; procErr != nil {
-						done <- fmt.Errorf("processing error: %w", procErr)
-						return
-					}
-					select {
-					case inErr := <-inputErrors:
-						if inErr != nil {
-							done <- fmt.Errorf("input error: %w", inErr)
-							return
-						}
-					default:
-					}
-					return
-				}
-				var processedLine string
-				select {
-				case <-pCtx.Done():
-					done <- pCtx.Err()
-					return
-				case processedLine, ok = <-processedLineCh:
-					if !ok {
-						// Channel was closed (orphaned work), continue to check for errors
-						continue
-					}
-				}
-
-				if output != nil && pCtx.Err() == nil {
-					if _, writeErr := output.Write([]byte(processedLine)); writeErr != nil {
-						done <- fmt.Errorf("output error: %w", writeErr)
-						return
-					}
-				}
-			case inErr := <-inputErrors:
-				if inErr != nil {
-					done <- fmt.Errorf("input error: %w", inErr)
-					return
-				}
-			case procErr := <-processingErrors:
-				if procErr != nil {
-					done <- fmt.Errorf("processing error: %w", procErr)
-					return
-				}
-			}
-		}
-	}()
-	select {
-	case <-pCtx.Done():
-		return pCtx.Err()
-	case err = <-done:
-		if err == nil && p.Config.PostSQL != "" {
-			_, err = output.Write([]byte(p.Config.PostSQL))
-		}
-		return err
-	}
-}
 
 type PreparedColumnOp struct {
 	Type             string              // "template" or "json"
@@ -743,6 +355,9 @@ func prepareTableConfigs(configData config.Config, registry *templates.Registry)
 	for _, tableConfig := range configData.TableConfigs {
 		preparedTableConfig, err := func() (*PreparedTableConfig, error) {
 			allTemplates := make(map[string]config.Template)
+			for name, tmpl := range configData.GlobalVariables {
+				allTemplates[".GlobalVariables."+name] = tmpl
+			}
 			for name, tmpl := range configData.TableVariables {
 				allTemplates[".TableVariables."+name] = tmpl
 			}
@@ -789,14 +404,10 @@ func prepareTableConfigs(configData config.Config, registry *templates.Registry)
 						case "json":
 							jsonFields := make([]jsonFieldOp, len(op.JsonFields))
 							for j, f := range op.JsonFields {
-								compiled, err := registry.GetCompiledTemplate(string(f.Template), fmt.Sprintf("json.%s.%s", colName, f.Path))
-								if err != nil {
-									return nil, fmt.Errorf("cannot compile JSON field template for path '%s': %w", f.Path, err)
-								}
-								jsonFields[j] = jsonFieldOp{
-									path:     f.Path,
-									template: compiled,
-								}
+								name := fmt.Sprintf("JSON.%q.%d.%d", colName, opIdx, j)
+								allTemplates[name] = f.Template
+								templatesForDependencyStack = append(templatesForDependencyStack, name)
+								jsonFields[j] = jsonFieldOp{path: f.Path, templateName: name}
 							}
 							ops[opIdx] = PreparedColumnOp{Type: "json", JsonFields: jsonFields}
 						}
@@ -834,13 +445,17 @@ func prepareTableConfigs(configData config.Config, registry *templates.Registry)
 					rowVariableTemplates = append(rowVariableTemplates, tmpl)
 				case strings.HasPrefix(tmpl.Name, ".ColumnVariables."):
 					columnVariableTemplates[tmpl.Name] = tmpl
-				case strings.HasPrefix(tmpl.Name, "Column"):
-					splitted := strings.Split(tmpl.Name, ".")
-					colName := splitted[1]
-					colIndex, _ := strconv.Atoi(splitted[2])
-					columnTemplates[colName][colIndex] = tmpl
+				case strings.HasPrefix(tmpl.Name, ".GlobalVariables."), strings.HasPrefix(tmpl.Name, "Column."), strings.HasPrefix(tmpl.Name, "JSON."):
+					// Global values were rendered once; operation roots are wired below.
 				default:
 					return nil, fmt.Errorf("unable to resolve dependency type for: %s", tmpl.Name)
+				}
+			}
+			// Resolve by the original column key instead of splitting template
+			// names: SQL column names can themselves contain dots.
+			for colName, list := range columnTemplates {
+				for i := range list {
+					list[i] = allCompiledTemplates["Column."+colName+"."+strconv.Itoa(i)]
 				}
 			}
 			// Wire up compiled templates into ColumnOps for "template" operations
@@ -850,33 +465,45 @@ func prepareTableConfigs(configData config.Config, registry *templates.Registry)
 					ops[mapping.opIndex].CompiledTemplate = compiledTmpl
 				}
 			}
-			// Precompute column variable dependency filter per template
-			columnVariableDeps := make(map[*templates.Template][]*templates.Template)
-			for _, colTemplates := range columnTemplates {
-				for _, tmpl := range colTemplates {
-					if tmpl == nil {
-						continue
+			// A variable cannot depend on a value evaluated at a later scope.
+			scope := func(name string) int {
+				for i, prefix := range []string{".GlobalVariables.", ".TableVariables.", ".RowVariables.", ".ColumnVariables."} {
+					if strings.HasPrefix(name, prefix) {
+						return i
 					}
-					var deps []*templates.Template
-					for _, dep := range tmpl.Dependencies {
-						if strings.HasPrefix(dep.Name, ".ColumnVariables") {
-							deps = append(deps, dep)
-						}
+				}
+				return 4
+			}
+			for _, tmpl := range allCompiledTemplates {
+				for _, dep := range tmpl.Dependencies {
+					if scope(dep.Name) > scope(tmpl.Name) {
+						return nil, fmt.Errorf("template %s cannot depend on later-scope variable %s", tmpl.Name, dep.Name)
 					}
-					columnVariableDeps[tmpl] = deps
 				}
 			}
-			// Also precompute for ColumnOps templates
+			// Precompute the transitive, topologically ordered column variables
+			// separately for each operation, including each JSON field.
+			columnVariableDeps := make(map[*templates.Template][]*templates.Template)
+			for _, name := range templatesForDependencyStack {
+				stack, err := templates.GetDependencyStackForMultipleTemplates([]string{name}, allCompiledTemplates)
+				if err != nil {
+					return nil, err
+				}
+				var deps []*templates.Template
+				for _, dep := range stack {
+					if strings.HasPrefix(dep.Name, ".ColumnVariables.") {
+						deps = append(deps, dep)
+					}
+				}
+				columnVariableDeps[allCompiledTemplates[name]] = deps
+			}
 			for _, ops := range columnOps {
-				for _, op := range ops {
-					if op.Type == "template" && op.CompiledTemplate != nil {
-						var deps []*templates.Template
-						for _, dep := range op.CompiledTemplate.Dependencies {
-							if strings.HasPrefix(dep.Name, ".ColumnVariables") {
-								deps = append(deps, dep)
-							}
-						}
-						columnVariableDeps[op.CompiledTemplate] = deps
+				for i := range ops {
+					for j := range ops[i].JsonFields {
+						field := &ops[i].JsonFields[j]
+						tmpl := allCompiledTemplates[field.templateName]
+						field.template = tmpl.CompiledTemplate
+						field.columnVariables = columnVariableDeps[tmpl]
 					}
 				}
 			}

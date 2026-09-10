@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type fakerData struct {
@@ -113,6 +114,7 @@ func TransformFirstName(input string, locale string) string {
 		return ""
 	}
 	rng := initRng(input)
+	defer rngPool.Put(rng)
 	data := localeData(locale)
 	return data.FirstNames[rng.Intn(len(data.FirstNames))]
 }
@@ -122,6 +124,7 @@ func TransformLastName(input string, locale string) string {
 		return ""
 	}
 	rng := initRng(input)
+	defer rngPool.Put(rng)
 	data := localeData(locale)
 	return data.LastNames[rng.Intn(len(data.LastNames))]
 }
@@ -131,6 +134,7 @@ func TransformStreet(input string, locale string) string {
 		return ""
 	}
 	rng := initRng(input)
+	defer rngPool.Put(rng)
 	streetNumner := rng.Intn(1000)
 	data := localeData(locale)
 	return data.StreetNames[rng.Intn(len(data.StreetNames))] + " " + strconv.Itoa(streetNumner)
@@ -141,6 +145,7 @@ func TransformCity(input string, locale string) string {
 		return ""
 	}
 	rng := initRng(input)
+	defer rngPool.Put(rng)
 	data := localeData(locale)
 	return data.Cities[rng.Intn(len(data.Cities))]
 }
@@ -162,6 +167,7 @@ func TransformCompanyName(input string, locale string) string {
 		return ""
 	}
 	rng := initRng(input)
+	defer rngPool.Put(rng)
 	data := localeData(locale)
 	companyNameParts := []string{}
 	companyNameParts = append(companyNameParts, data.Companies[rng.Intn(len(data.Companies))])
@@ -181,6 +187,7 @@ func TransformBusinessId(input string, locale string) string {
 		return ""
 	}
 	rng := initRng(input)
+	defer rngPool.Put(rng)
 
 	format := localeData(locale).BusinessIdFormat
 
@@ -196,8 +203,18 @@ func TransformBusinessId(input string, locale string) string {
 	return result.String()
 }
 
+// Each transform exclusively borrows a generator and reseeds it from its input.
+// Reusing math/rand's source avoids allocating its large state per value while
+// preserving the existing deterministic mappings. The pool retains no inputs.
+var rngPool = sync.Pool{New: func() any {
+	return rand.New(rand.NewSource(1))
+}}
+
+// initRng returns a generator that the caller must return to rngPool after use.
 func initRng(input string) *rand.Rand {
 	h := fnv.New64a()
 	h.Write([]byte(input))
-	return rand.New(rand.NewSource(int64(h.Sum64())))
+	rng := rngPool.Get().(*rand.Rand)
+	rng.Seed(int64(h.Sum64()))
+	return rng
 }

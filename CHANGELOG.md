@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.6.0 — 2026-09-10
+
+- Fix pipeline hangs on live-stream errors, SQL statement boundaries, and schema ordering.
+- Preserve multiple statements per line and trailing input; honor INSERT column order and database-specific schemas.
+- Stop emitting original rows when anonymization fails and correct row counters for quoted tuple separators.
+- Add configurable worker/input memory limits, cap pooled buffers, and reduce copying and template reflection allocations.
+- Reduce extended-INSERT buffer growth and accelerate quoted-literal scanning; add opt-in benchmarks for local dumps.
+- Reuse faker random generators to reduce per-value allocations while preserving deterministic outputs across locales.
+- Resolve nested and JSON template dependencies transitively, render JSON column variables per field/element, and reject undefined references, variable cycles, and later-scope dependencies during construction. Recursive named-template invocations are now rejected.
+- Add concurrent library progress snapshots with I/O counters, worker/table activity, wait durations, and failure context, without emitting logs.
+- Interrupt closable streams on failure/cancellation, report CLI flush failures, and prevent same-file input/output truncation.
+
 ## [Unreleased] - 2024-12-22
 
 ### Changed
